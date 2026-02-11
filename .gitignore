@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.so
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+
+# 本地数据（部署时不需要，用户自行上传）
+原始底表.xlsx
+.~*.xlsx
+
+# IDE / OS
+.DS_Store
+.idea/
+*.swp
+*.swo
+Untitled
+
+# 示例报告、临时文件
+报告示例_*.html
+Untitled

@@ -1,0 +1,8 @@
+# 浅色主题 + Ant Design 风格主色
+[theme]
+base = "light"
+primaryColor = "#1677ff"
+backgroundColor = "#f5f5f5"
+secondaryBackgroundColor = "#fafafa"
+textColor = "rgba(0, 0, 0, 0.88)"
+font = "sans serif"
