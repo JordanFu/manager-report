@@ -43,17 +43,21 @@ STOPWORDS_CN = {
     "无", "希望", "可以", "能够", "更多", "一些", "什么", "怎么", "如何", "为什么",
 }
 
-def _get_chinese_font_path():
-    """返回系统可用的中文字体路径，用于词云（兼容 macOS / Windows / Linux 线上环境）"""
+def _get_chinese_font_path(app_dir: str = None):
+    """返回系统可用的中文字体路径，用于词云（兼容 macOS / Windows / Linux 线上环境）。"""
+    # 1) 优先使用应用目录下捆绑字体（部署可靠）
+    if app_dir:
+        for name in ("NotoSansSC-Regular.otf", "NotoSansSC-Regular.ttf", "font.ttf", "NotoSansCJK-Regular.ttc"):
+            path = os.path.join(app_dir, "fonts", name)
+            if os.path.isfile(path):
+                return path
+    # 2) 系统字体路径
     candidates = [
-        # macOS
         "/System/Library/Fonts/PingFang.ttc",
         "/System/Library/Fonts/Supplemental/Songti.ttc",
         "/Library/Fonts/Arial Unicode.ttf",
-        # Windows
         "C:/Windows/Fonts/msyh.ttc",
         "C:/Windows/Fonts/simhei.ttf",
-        # Linux / Streamlit Cloud 常见路径
         "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
@@ -64,7 +68,7 @@ def _get_chinese_font_path():
     for path in candidates:
         if os.path.isfile(path):
             return path
-    # 通过 matplotlib 字体列表查找任意 CJK 字体（线上环境常带 Noto 等）
+    # 3) matplotlib 字体列表中的 CJK
     try:
         import matplotlib.font_manager as fm
         for f in fm.fontManager.ttflist:
@@ -72,31 +76,47 @@ def _get_chinese_font_path():
             if not path or not os.path.isfile(path):
                 continue
             name = (f.name or "").lower()
-            if "noto" in name or "cjk" in name or "sans" in name and ("sc" in name or "tc" in name or "jp" in name or "kr" in name):
+            if "noto" in name or "cjk" in name or ("sans" in name and ("sc" in name or "tc" in name or "jp" in name or "kr" in name)):
                 return path
     except Exception:
         pass
-    # 线上无系统 CJK 字体时：下载 Noto Sans SC 并缓存，保证词云能显示中文
+    # 4) 下载并缓存（多 URL、缓存字节，提高线上成功率）
     return _download_chinese_font_cached()
 
 
+@st.cache_data(ttl=3600)
+def _fetch_font_bytes():
+    """下载中文字体字节并缓存，返回 bytes 或 None。"""
+    urls = [
+        "https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/notosanssc/NotoSansSC-Regular.otf",
+        "https://github.com/google/fonts/raw/main/ofl/notosanssc/NotoSansSC-Regular.otf",
+    ]
+    for url in urls:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; Streamlit)"})
+            with urllib.request.urlopen(req, timeout=25) as resp:
+                data = resp.read()
+            if len(data) > 50000:
+                return data
+        except Exception:
+            continue
+    return None
+
+
 def _download_chinese_font_cached():
-    """无系统字体时下载并缓存中文字体，返回本地路径；失败返回 None。"""
+    """无系统字体时下载并缓存中文字体到临时文件，返回路径；失败返回 None。"""
     cache_dir = tempfile.gettempdir()
     cache_path = os.path.join(cache_dir, "NotoSansSC-Regular-wordcloud.otf")
     if os.path.isfile(cache_path):
         return cache_path
-    url = "https://github.com/google/fonts/raw/main/ofl/notosanssc/NotoSansSC-Regular.otf"
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Streamlit-App"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = resp.read()
-        if len(data) > 1000:
+    data = _fetch_font_bytes()
+    if data:
+        try:
             with open(cache_path, "wb") as f:
                 f.write(data)
             return cache_path
-    except Exception:
-        pass
+        except Exception:
+            pass
     return None
 
 def _make_center_ellipse_mask(width: int, height: int, ratio=0.58):
@@ -154,7 +174,7 @@ def build_wordcloud_image(text: str, width=900, height=380, mask_dir: str = None
         return None, []
     freq = Counter(words)
     top_words = [w for w, _ in freq.most_common(20)]
-    font_path = _get_chinese_font_path()
+    font_path = _get_chinese_font_path(mask_dir)
     mask, overlay_img = None, None
     if mask_dir:
         mask, overlay_img = _load_wordcloud_mask_and_overlay(
@@ -916,13 +936,13 @@ with tab2:
                 fig_dim = apply_chart_style(fig_dim)
                 st.plotly_chart(fig_dim, use_container_width=True, config=PLOTLY_CONFIG)
 
-# ---------- Tab 3: 个人详细报告（详情页 · 层次分明、直截了当） ----------
+# ---------- Tab 3: 个人详细报告（与左侧栏学员筛选联动） ----------
 with tab3:
-    # 1. 人员筛选区域（保留）
-    st.markdown("#### 选择员工")
-    selected_for_tab3 = st.selectbox("学员", names, index=names.index(selected_name), key="sel_tab3", label_visibility="collapsed")
+    # 与左侧栏「学员筛选」共用同一选择，无需重复选
+    st.markdown(f"#### 当前学员：**{selected_name}**")
+    st.caption("在左侧边栏「学员筛选」中切换学员，本页会同步更新。")
 
-    idx = names.index(selected_for_tab3)
+    idx = names.index(selected_name)
     row_index = df_q.index[idx]
     profile_row = df.iloc[idx]
     dim_cols = [c for c in CATEGORY_ORDER if c in df_dims.columns]
@@ -956,7 +976,7 @@ with tab3:
         above_text = ""
         if above:
             dims_joined = "」「".join(above)
-            above_text = f'<p style="margin:4px 0 0 0; font-size:14px; line-height:1.5;"><strong>💪 高于全员</strong>：{selected_for_tab3} 在「{dims_joined}」上达到或超过全员平均。</p>'
+            above_text = f'<p style="margin:4px 0 0 0; font-size:14px; line-height:1.5;"><strong>💪 高于全员</strong>：{selected_name} 在「{dims_joined}」上达到或超过全员平均。</p>'
         st.markdown(
             f'<div style="margin:0;">'
             f'<p style="font-size:24px; font-weight:600; color:rgba(0,0,0,0.88); margin:4px 0 0 0;">{total_person:.2f}</p>'
@@ -974,7 +994,7 @@ with tab3:
             st.markdown("</div>", unsafe_allow_html=True)
 
     with col_radar:
-        st.markdown(f"**{selected_for_tab3}** · 五维度得分 vs 全员均分")
+        st.markdown(f"**{selected_name}** · 五维度得分 vs 全员均分")
         theta_radar = dim_cols if dim_cols else []
         r_person = [float(row_dims[c]) for c in theta_radar]
         r_avg = [float(dim_means_all[c]) for c in theta_radar]
@@ -986,7 +1006,7 @@ with tab3:
                 fill="toself",
                 fillcolor="rgba(52, 152, 219, 0.35)",
                 line=dict(color="#3498DB", width=2),
-                name=selected_for_tab3,
+                name=selected_name,
             ))
             fig_radar.add_trace(go.Scatterpolar(
                 r=r_avg + [r_avg[0]],
