@@ -7,6 +7,8 @@
 import io
 import math
 import os
+import tempfile
+import urllib.request
 from collections import Counter
 import streamlit as st
 import pandas as pd
@@ -42,17 +44,59 @@ STOPWORDS_CN = {
 }
 
 def _get_chinese_font_path():
-    """返回系统可用的中文字体路径，用于词云"""
+    """返回系统可用的中文字体路径，用于词云（兼容 macOS / Windows / Linux 线上环境）"""
     candidates = [
-        "/System/Library/Fonts/PingFang.ttc",  # macOS
+        # macOS
+        "/System/Library/Fonts/PingFang.ttc",
         "/System/Library/Fonts/Supplemental/Songti.ttc",
         "/Library/Fonts/Arial Unicode.ttf",
-        "C:/Windows/Fonts/msyh.ttc",  # Windows 微软雅黑
+        # Windows
+        "C:/Windows/Fonts/msyh.ttc",
         "C:/Windows/Fonts/simhei.ttf",
+        # Linux / Streamlit Cloud 常见路径
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+        "/usr/share/fonts/truetype/arphic/uming.ttc",
+        "/usr/share/fonts/truetype/fonts-japanese-gothic/fonts-japanese-gothic.ttf",
     ]
     for path in candidates:
         if os.path.isfile(path):
             return path
+    # 通过 matplotlib 字体列表查找任意 CJK 字体（线上环境常带 Noto 等）
+    try:
+        import matplotlib.font_manager as fm
+        for f in fm.fontManager.ttflist:
+            path = getattr(f, "fname", None)
+            if not path or not os.path.isfile(path):
+                continue
+            name = (f.name or "").lower()
+            if "noto" in name or "cjk" in name or "sans" in name and ("sc" in name or "tc" in name or "jp" in name or "kr" in name):
+                return path
+    except Exception:
+        pass
+    # 线上无系统 CJK 字体时：下载 Noto Sans SC 并缓存，保证词云能显示中文
+    return _download_chinese_font_cached()
+
+
+def _download_chinese_font_cached():
+    """无系统字体时下载并缓存中文字体，返回本地路径；失败返回 None。"""
+    cache_dir = tempfile.gettempdir()
+    cache_path = os.path.join(cache_dir, "NotoSansSC-Regular-wordcloud.otf")
+    if os.path.isfile(cache_path):
+        return cache_path
+    url = "https://github.com/google/fonts/raw/main/ofl/notosanssc/NotoSansSC-Regular.otf"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Streamlit-App"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = resp.read()
+        if len(data) > 1000:
+            with open(cache_path, "wb") as f:
+                f.write(data)
+            return cache_path
+    except Exception:
+        pass
     return None
 
 def _make_center_ellipse_mask(width: int, height: int, ratio=0.58):
@@ -126,9 +170,10 @@ def build_wordcloud_image(text: str, width=900, height=380, mask_dir: str = None
         max_font_size=72,
         min_font_size=12,
         colormap="Oranges",
-        font_path=font_path,
         margin=3,
     )
+    if font_path:
+        kw["font_path"] = font_path
     if mask is not None:
         kw["mask"] = mask
         kw["contour_width"] = 0
