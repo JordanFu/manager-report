@@ -2,6 +2,14 @@
 
 基于问卷底表（.xlsx / .csv）生成**管理者调研报告**的 Streamlit 应用，支持全局概览、维度深度分析、个人详细报告、开放反馈与异常提醒。
 
+## 让任何人通过网页访问（约 2 分钟）
+
+1. 打开 **[https://share.streamlit.io](https://share.streamlit.io)**，用 **GitHub** 登录  
+2. 点击 **New app**，仓库填：`https://github.com/JordanFu/manager-report`，主文件填：`app.py`  
+3. 点击 **Deploy**，等待完成后即得到公网链接（如 `https://xxx.streamlit.app`），分享给任何人即可使用  
+
+详细图文步骤见 **[一键部署-任何人可访问.md](一键部署-任何人可访问.md)**。
+
 ## 功能概览
 
 - **数据上传**：左侧边栏上传问卷底表（五级量表，含「填写人」/「姓名」列）
