@@ -44,11 +44,12 @@ STOPWORDS_CN = {
 }
 
 def _font_candidates_in_dir(directory: str):
-    """在指定目录下生成 fonts/ 中字体候选路径。"""
+    """在指定目录下生成 fonts/ 中字体候选路径。Pillow/WordCloud 仅可靠支持 TTF，优先 TTF。"""
     if not directory:
         return []
     return [os.path.join(directory, "fonts", name) for name in (
-        "NotoSansSC-Regular.otf", "NotoSansSC-Regular.ttf", "font.ttf", "NotoSansCJK-Regular.ttc"
+        "NotoSansSC-Regular.ttf", "font.ttf", "NotoSansCJK-Regular.ttc",
+        "NotoSansSC-Regular.otf",
     )]
 
 
@@ -94,15 +95,16 @@ def _get_chinese_font_path(app_dir: str = None):
 
 @st.cache_data(ttl=3600)
 def _fetch_font_bytes():
-    """下载中文字体字节并缓存，返回 bytes 或 None。"""
+    """下载中文字体 TTF 字节并缓存（Pillow/WordCloud 对 OTF 易报 unknown file format）。"""
+    # 优先 TTF：Pillow/WordCloud 对 OTF 会报 unknown file format
     urls = [
-        "https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/notosanssc/NotoSansSC-Regular.otf",
-        "https://github.com/google/fonts/raw/main/ofl/notosanssc/NotoSansSC-Regular.otf",
+        "https://cdn.jsdelivr.net/gh/jsntn/webfonts@master/NotoSansSC-Regular.ttf",
+        "https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/notosanssc/NotoSansSC%5Bwght%5D.ttf",
     ]
     for url in urls:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; Streamlit)"})
-            with urllib.request.urlopen(req, timeout=25) as resp:
+            with urllib.request.urlopen(req, timeout=30) as resp:
                 data = resp.read()
             if len(data) > 50000:
                 return data
@@ -112,9 +114,9 @@ def _fetch_font_bytes():
 
 
 def _download_chinese_font_cached():
-    """无系统字体时下载并缓存中文字体到临时文件，返回路径；失败返回 None。"""
+    """无系统字体时下载并缓存中文字体到临时文件（TTF），返回路径；失败返回 None。"""
     cache_dir = tempfile.gettempdir()
-    cache_path = os.path.join(cache_dir, "NotoSansSC-Regular-wordcloud.otf")
+    cache_path = os.path.join(cache_dir, "NotoSansSC-wordcloud.ttf")
     if os.path.isfile(cache_path):
         return cache_path
     data = _fetch_font_bytes()
