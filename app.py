@@ -43,13 +43,21 @@ STOPWORDS_CN = {
     "无", "希望", "可以", "能够", "更多", "一些", "什么", "怎么", "如何", "为什么",
 }
 
+def _font_candidates_in_dir(directory: str):
+    """在指定目录下生成 fonts/ 中字体候选路径。"""
+    if not directory:
+        return []
+    return [os.path.join(directory, "fonts", name) for name in (
+        "NotoSansSC-Regular.otf", "NotoSansSC-Regular.ttf", "font.ttf", "NotoSansCJK-Regular.ttc"
+    )]
+
+
 def _get_chinese_font_path(app_dir: str = None):
     """返回系统可用的中文字体路径，用于词云（兼容 macOS / Windows / Linux 线上环境）。"""
-    # 1) 优先使用应用目录下捆绑字体（部署可靠）
-    if app_dir:
-        for name in ("NotoSansSC-Regular.otf", "NotoSansSC-Regular.ttf", "font.ttf", "NotoSansCJK-Regular.ttc"):
-            path = os.path.join(app_dir, "fonts", name)
-            if os.path.isfile(path):
+    # 1) 优先使用应用目录下捆绑字体（线下=__file__ 所在目录，线上=可能用 getcwd）
+    for base in ([app_dir] if app_dir else []) + [os.getcwd()]:
+        for path in _font_candidates_in_dir(base):
+            if path and os.path.isfile(path):
                 return path
     # 2) 系统字体路径
     candidates = [
@@ -160,23 +168,27 @@ def _load_wordcloud_mask_and_overlay(app_dir: str, width=900, height=380, charac
         return None, None
 
 
-def build_wordcloud_image(text: str, width=900, height=380, mask_dir: str = None):
+def build_wordcloud_image(text: str, width=900, height=380, mask_dir: str = None, use_mask: bool = True):
     """
-    根据反馈文本生成词云图：红/橙配色，文字围绕卡通形象（保持比例）。
-    返回 (PNG 字节流, 高频词列表)，失败时返回 (None, [])。
+    根据反馈文本生成词云图：红/橙配色，可选文字围绕卡通形象（保持比例）。
+    use_mask=False 时仅用 mask_dir 取字体，不加载蒙版（便于蒙版异常时回退）。
+    返回 (PNG 字节流, 高频词列表, 错误信息)；成功时错误信息为 None。
     """
     text = (text or "").strip()
     if not text:
-        return None, []
+        return None, [], None
     segs = jieba.lcut(text)
     words = [w for w in segs if len(w) >= 2 and w not in STOPWORDS_CN and w.strip()]
+    if not words and len(text) >= 2:
+        words = [w for w in segs if w.strip() and w not in STOPWORDS_CN and len(w) >= 1]
     if not words:
-        return None, []
+        return None, [], None
     freq = Counter(words)
     top_words = [w for w, _ in freq.most_common(20)]
+    # 线下=__file__ 目录，线上=再试 getcwd，保证能找到 fonts/
     font_path = _get_chinese_font_path(mask_dir)
     mask, overlay_img = None, None
-    if mask_dir:
+    if mask_dir and use_mask:
         mask, overlay_img = _load_wordcloud_mask_and_overlay(
             mask_dir, width=width, height=height, character_ratio=0.58
         )
@@ -198,6 +210,7 @@ def build_wordcloud_image(text: str, width=900, height=380, mask_dir: str = None
         kw["mask"] = mask
         kw["contour_width"] = 0
         kw["contour_color"] = "white"
+    err_msg = None
     try:
         wc = WordCloud(**kw)
         wc.generate_from_frequencies(freq)
@@ -208,8 +221,9 @@ def build_wordcloud_image(text: str, width=900, height=380, mask_dir: str = None
         buf = io.BytesIO()
         out.save(buf, format="PNG")
         buf.seek(0)
-        return buf, top_words
-    except Exception:
+        return buf, top_words, None
+    except Exception as e:
+        err_msg = str(e)
         kw.pop("mask", None)
         kw.pop("contour_width", None)
         kw.pop("contour_color", None)
@@ -219,9 +233,9 @@ def build_wordcloud_image(text: str, width=900, height=380, mask_dir: str = None
             buf = io.BytesIO()
             wc.to_image().save(buf, format="PNG")
             buf.seek(0)
-            return buf, top_words
-        except Exception:
-            return None, []
+            return buf, top_words, None
+        except Exception as e2:
+            return None, [], (err_msg + "; 无蒙版重试: " + str(e2))
 
 # ---------- 页面配置（必须最先） ----------
 st.set_page_config(
@@ -1114,6 +1128,12 @@ with tab4:
     name_col_df = next((c for c in ["填写人", "姓名", "学员姓名"] if c in df.columns), None)
     dept_col = "部门" if "部门" in df.columns else None
     open_cols = [c for c in OPEN_QUESTION_COLS if c in df.columns]
+    # 兼容列名标点差异（全角/半角）：若配置列未匹配，则用包含关键字的列
+    if not open_cols:
+        for col in df.columns:
+            if isinstance(col, str) and ("培训" in col and "期待" in col) or "开放" in col or "反馈" in col:
+                open_cols.append(col)
+                break
     if not name_col_df or not open_cols:
         st.info("当前数据中未找到「填写人」或开放性问题列（如「您对这次培训还有哪些期待？」），无法展示。")
     else:
@@ -1151,9 +1171,13 @@ with tab4:
             with col_wc:
                 st.markdown("##### 伙伴反馈词云")
                 st.caption("根据开放反馈内容生成")
-                wc_buf, top_keywords = build_wordcloud_image(
+                wc_buf, top_keywords, wc_err = build_wordcloud_image(
                     combined_text, width=420, height=320, mask_dir=_app_dir
                 )
+                if not wc_buf and len(combined_text.strip()) > 20:
+                    wc_buf, top_keywords, wc_err = build_wordcloud_image(
+                        combined_text, width=420, height=320, mask_dir=_app_dir, use_mask=False
+                    )
                 if wc_buf:
                     st.image(wc_buf, use_container_width=True)
                     if top_keywords:
@@ -1165,6 +1189,9 @@ with tab4:
                         )
                 else:
                     st.caption("反馈内容过少，暂无法生成词云。")
+                    if wc_err:
+                        with st.expander("词云生成失败原因（可截图反馈）"):
+                            st.code(wc_err, language=None)
 
             with col_detail:
                 st.markdown("##### 填写明细")
