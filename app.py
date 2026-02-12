@@ -7,6 +7,8 @@
 import io
 import math
 import os
+import subprocess
+import sys
 import tempfile
 import urllib.request
 from collections import Counter
@@ -18,6 +20,11 @@ import jieba
 from PIL import Image
 from wordcloud import WordCloud
 
+# 用于 PDF 图表导出：无界面后端，避免 kaleido 不可用时无图
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 from config import (
     CATEGORY_ORDER,
     COLORS_BARS,
@@ -25,6 +32,7 @@ from config import (
     BASIC_INFO_COLS,
     BASIC_INFO_DISPLAY,
     OPEN_QUESTION_COLS,
+    LEARNING_MODULE_COL,
 )
 from data_processor import (
     clean_and_score,
@@ -34,6 +42,7 @@ from data_processor import (
     get_all_behavior_avgs,
     get_person_total_and_dims,
 )
+from pdf_generator import PDFReport, REPORTLAB_AVAILABLE, REPORTLAB_IMPORT_ERROR
 
 # 中文停用词（词云过滤）
 STOPWORDS_CN = {
@@ -654,6 +663,121 @@ PLOTLY_CONFIG = {
     "displaylogo": False,
 }
 
+def _radar_chart_matplotlib(dim_labels, person_vals, out_buffer, avg_vals=None):
+    """用 matplotlib 绘制五维度雷达图。可叠加全员平均线对比。dim_labels 与 person_vals 长度均为 5。"""
+    plt.rcParams["font.sans-serif"] = ["SimHei", "PingFang SC", "Microsoft YaHei", "DejaVu Sans", "sans-serif"]
+    plt.rcParams["axes.unicode_minus"] = False
+    n = len(dim_labels)
+    if n == 0:
+        return
+    angles = [2 * math.pi * i / n for i in range(n)]
+    angles_close = angles + [angles[0]]
+
+    def _safe_vals(vals, length):
+        out = []
+        for v in (vals or [])[:length]:
+            try:
+                x = float(v)
+                out.append(x if x == x else 0.0)
+            except (TypeError, ValueError):
+                out.append(0.0)
+        while len(out) < length:
+            out.append(0.0)
+        return out[:length]
+
+    vals = _safe_vals(person_vals, n)
+    vals_close = vals + [vals[0]]
+    fig, ax = plt.subplots(figsize=(3.2, 3.2), subplot_kw=dict(projection="polar"))
+    # 全员平均（先画，在底层）
+    if avg_vals is not None and len(avg_vals) >= n:
+        avg = _safe_vals(avg_vals, n)
+        avg_close = avg + [avg[0]]
+        ax.fill(angles_close, avg_close, alpha=0.15, color="#94a3b8")
+        ax.plot(angles_close, avg_close, "o-", linewidth=1.5, color="#94a3b8", linestyle="--", markersize=3, label="全员平均")
+    # 员工自评（后画，在上层）
+    ax.fill(angles_close, vals_close, alpha=0.25, color="#3498DB")
+    ax.plot(angles_close, vals_close, "o-", linewidth=2, color="#3498DB", markersize=4, label="员工自评")
+    ax.set_xticks(angles)
+    ax.set_xticklabels(dim_labels, size=9)
+    ax.set_ylim(0, 5.5)
+    ax.set_yticks([1, 2, 3, 4, 5])
+    ax.set_theta_zero_location("N")
+    ax.set_theta_direction(-1)
+    ax.legend(loc="upper right", fontsize=7)
+    fig.tight_layout()
+    fig.savefig(out_buffer, format="png", dpi=100, bbox_inches="tight")
+    plt.close(fig)
+    out_buffer.seek(0)
+
+
+def _line_chart_behavior_matplotlib(labels, values, out_buffer, color_scheme=None):
+    """用 matplotlib 绘制模块+行为项得分折线图。x=模块-行为项，y=得分；按模块着色，y 轴随数据范围以突出趋势。"""
+    plt.rcParams["font.sans-serif"] = ["SimHei", "PingFang SC", "Microsoft YaHei", "DejaVu Sans", "sans-serif"]
+    plt.rcParams["axes.unicode_minus"] = False
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    x_pos = list(range(len(labels)))
+    vals = [float(v) if v is not None and str(v) != "nan" else 0.0 for v in values]
+    if not vals:
+        out_buffer.seek(0)
+        return
+    scheme = color_scheme or {}
+    modules = [lab.split("-", 1)[0] if "-" in lab else "" for lab in labels]
+    colors = [scheme.get(m, "#2980B9") for m in modules]
+    for i in range(len(x_pos) - 1):
+        ax.plot(x_pos[i : i + 2], vals[i : i + 2], "-", color=colors[i], linewidth=2)
+    ax.scatter(x_pos, vals, c=colors, s=28, zorder=5, edgecolors="white", linewidths=0.8)
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+    ax.set_ylabel("得分")
+    ax.set_xlabel("模块-行为项")
+    y_min, y_max = min(vals), max(vals)
+    margin = 0.45
+    if y_max - y_min < 0.3:
+        ax.set_ylim(max(0.5, y_min - 0.5), min(5.5, y_max + 0.5))
+    else:
+        ax.set_ylim(max(0.5, y_min - margin), min(5.5, y_max + margin))
+    ax.grid(True, linestyle="--", alpha=0.6)
+    seen = []
+    for m in modules:
+        if m and m not in seen and m in scheme:
+            seen.append(m)
+    if seen:
+        from matplotlib.patches import Patch
+        ax.legend(
+            [Patch(facecolor=scheme[m], edgecolor="none") for m in seen],
+            seen,
+            loc="upper right",
+            fontsize=8,
+            ncol=2,
+        )
+    fig.tight_layout()
+    fig.savefig(out_buffer, format="png", dpi=100, bbox_inches="tight")
+    plt.close(fig)
+    out_buffer.seek(0)
+
+
+def _summary_chart_matplotlib(dims, scores, bar_colors, out_buffer):
+    """用 matplotlib 绘制五维度得分柱状图并写入 out_buffer（kaleido 不可用时的备选）。"""
+    plt.rcParams["font.sans-serif"] = ["SimHei", "PingFang SC", "Microsoft YaHei", "DejaVu Sans", "sans-serif"]
+    plt.rcParams["axes.unicode_minus"] = False
+    fig, ax = plt.subplots(figsize=(10, 4))
+    x_pos = range(len(dims))
+    bars = ax.bar(x_pos, scores, color=bar_colors, edgecolor="gray", linewidth=0.5)
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(dims, rotation=25, ha="right")
+    ax.set_ylabel("得分")
+    ax.set_xlabel("维度")
+    ax.set_ylim(0, 5.5)
+    ax.set_yticks([0, 1, 2, 3, 4, 5])
+    ax.grid(axis="y", linestyle="--", alpha=0.7)
+    for b, v in zip(bars, scores):
+        ax.text(b.get_x() + b.get_width() / 2, b.get_height() + 0.08, "%.2f" % v, ha="center", va="bottom", fontsize=10)
+    fig.tight_layout()
+    fig.savefig(out_buffer, format="png", dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    out_buffer.seek(0)
+
+
 def apply_chart_style(fig, font_size=12):
     fig.update_layout(
         paper_bgcolor="rgba(0,0,0,0)",
@@ -807,6 +931,202 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### 👤 学员筛选")
     selected_name = st.selectbox("选择学员", names, key="sel_name", label_visibility="collapsed")
+    st.markdown("---")
+    st.markdown("### 📥 生成 PDF 报告")
+    if not REPORTLAB_AVAILABLE:
+        err_detail = (" " + REPORTLAB_IMPORT_ERROR) if REPORTLAB_IMPORT_ERROR else ""
+        st.warning(
+            "PDF 功能需要 reportlab。请点击下方按钮用当前环境安装，安装后页面会自动刷新。"
+            + (("\n\n导入报错：" + err_detail) if err_detail else "")
+        )
+        if st.button("用当前环境安装 reportlab", key="install_reportlab", use_container_width=True):
+            with st.spinner("正在安装 reportlab..."):
+                r = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "reportlab"],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+            if r.returncode == 0:
+                st.success("安装成功，正在刷新页面…")
+                st.rerun()
+            else:
+                st.error("安装失败。请在终端执行：**" + sys.executable + " -m pip install reportlab**\n\n" + (r.stderr or r.stdout or ""))
+    elif st.button("📥 生成 PDF 报告", key="gen_pdf", use_container_width=True):
+        _app_dir = os.path.dirname(os.path.abspath(__file__))
+        dim_cols = [c for c in CATEGORY_ORDER if c in df_dims.columns]
+        dim_means = [(c, float(df_dims[c].mean())) for c in dim_cols]
+        behavior_avgs = get_behavior_avg_by_dimension(df_q, col_to_cat_be)
+        summary_chart_png = io.BytesIO()
+        radar_png = io.BytesIO()
+        summary = pd.DataFrame({"维度": [x[0] for x in dim_means], "全员平均分": [x[1] for x in dim_means]})
+        dims = summary["维度"].tolist()
+        scores = summary["全员平均分"].values
+        bar_colors = [COLOR_SCHEME.get(d, "#3498db") for d in dims]
+        try:
+            fig_summary = go.Figure(data=[go.Bar(
+                x=dims,
+                y=summary["全员平均分"],
+                marker_color=bar_colors,
+                text=summary["全员平均分"].round(2),
+                texttemplate="%{text:.2f}",
+                textposition="outside",
+                textfont=dict(size=12),
+            )])
+            fig_summary.update_layout(
+                xaxis_title="维度",
+                yaxis_title="得分",
+                yaxis=dict(range=[0, 5.5], dtick=1, showgrid=True, gridcolor="#e8e8e8"),
+                height=340,
+                margin=dict(b=100, t=50, l=60, r=40),
+                showlegend=False,
+            )
+            fig_summary.update_xaxes(tickangle=-25, tickfont=dict(size=11))
+            fig_summary = apply_chart_style(fig_summary)
+            try:
+                img_bytes = fig_summary.to_image(format="png", engine="kaleido")
+                summary_chart_png.write(img_bytes)
+            except Exception:
+                try:
+                    fig_summary.write_image(summary_chart_png, format="png", engine="kaleido")
+                except Exception:
+                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                        try:
+                            fig_summary.write_image(tmp.name, format="png", engine="kaleido")
+                            with open(tmp.name, "rb") as f:
+                                summary_chart_png.write(f.read())
+                        finally:
+                            try:
+                                os.unlink(tmp.name)
+                            except Exception:
+                                pass
+            summary_chart_png.seek(0)
+        except Exception:
+            summary_chart_png = io.BytesIO()
+        if len(summary_chart_png.getvalue()) == 0:
+            try:
+                _summary_chart_matplotlib(dims, scores, bar_colors, summary_chart_png)
+            except Exception:
+                pass
+        summary_chart_png.seek(0)
+        behavior_chart_png = io.BytesIO()
+        try:
+            labels_avg, values_avg = get_all_behavior_avgs(df_q, col_to_cat_be)
+            if labels_avg and values_avg:
+                _line_chart_behavior_matplotlib(labels_avg, values_avg, behavior_chart_png, color_scheme=COLOR_SCHEME)
+        except Exception:
+            pass
+        behavior_chart_png.seek(0)
+        try:
+            idx = names.index(selected_name)
+            row_index = df_q.index[idx]
+            row_dims = df_dims.loc[row_index, dim_cols] if dim_cols else pd.Series(dtype=float)
+            dim_means_all = df_dims[dim_cols].mean() if dim_cols else pd.Series(dtype=float)
+            theta_radar = dim_cols
+            r_person = [float(row_dims[c]) for c in theta_radar]
+            r_avg = [float(dim_means_all[c]) for c in theta_radar]
+            if len(r_person) == 5:
+                fig_radar = go.Figure()
+                fig_radar.add_trace(go.Scatterpolar(
+                    r=r_person + [r_person[0]], theta=theta_radar + [theta_radar[0]],
+                    fill="toself", fillcolor="rgba(52, 152, 219, 0.35)", line=dict(color="#3498DB", width=2),
+                    name=selected_name,
+                ))
+                fig_radar.add_trace(go.Scatterpolar(
+                    r=r_avg + [r_avg[0]], theta=theta_radar + [theta_radar[0]],
+                    fill="toself", fillcolor="rgba(200,200,200,0.2)", line=dict(color="#94a3b8", width=1.5, dash="dash"),
+                    name="全员均分",
+                ))
+                fig_radar.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 5.5])), showlegend=True, height=400)
+                fig_radar = apply_chart_style(fig_radar)
+                try:
+                    radar_png.write(fig_radar.to_image(format="png", engine="kaleido"))
+                except Exception:
+                    fig_radar.write_image(radar_png, format="png", engine="kaleido")
+                radar_png.seek(0)
+        except Exception:
+            radar_png = io.BytesIO()
+        person_scores = list(zip(names, [float(total.loc[df_q.index[i]]) for i in range(len(df_q))]))
+        person_scores.sort(key=lambda x: x[1], reverse=True)
+        top3_high = person_scores[:3]
+        top3_low = person_scores[-3:][::-1] if len(person_scores) >= 3 else person_scores[::-1]
+        score_cols = list(col_to_cat_be.keys())
+        anomaly_rows = []
+        name_col_anom = next((c for c in ["填写人", "姓名", "学员姓名"] if c in df.columns), None)
+        dept_col_anom = "部门" if "部门" in df.columns else None
+        for idx in df_q.index:
+            row = df_q.loc[idx, score_cols]
+            valid = row.dropna()
+            if len(valid) >= 1 and valid.nunique() == 1:
+                uniform_score = float(valid.iloc[0])
+                name = df.loc[idx, name_col_anom] if name_col_anom else str(idx)
+                dept = df.loc[idx, dept_col_anom] if dept_col_anom else None
+                note = f"该伙伴所有题目均为 {uniform_score:.1f} 分，建议管理者关注。"
+                anomaly_rows.append((name, dept, uniform_score, note))
+        summary_votes = []
+        learning_col = LEARNING_MODULE_COL if LEARNING_MODULE_COL in df.columns else next(
+            (c for c in df.columns if "技能模块" in str(c) and "深入" in str(c)), None
+        )
+        if learning_col is not None:
+            counts = Counter()
+            for val in df[learning_col].dropna().astype(str):
+                for sep in ["，", "、", "；", ";", ",", "\n"]:
+                    val = val.replace(sep, "\t")
+                for part in val.split("\t"):
+                    token = part.strip()
+                    if token in CATEGORY_ORDER:
+                        counts[token] += 1
+            summary_votes = sorted(counts.items(), key=lambda x: -x[1])
+        dim_means_all = df_dims[dim_cols].mean() if dim_cols else pd.Series(dtype=float)
+        avg_dims = [float(dim_means_all[c]) for c in dim_cols] if len(dim_cols) == 5 else None
+        person_details = []
+        for i in range(len(names)):
+            name = names[i]
+            row_index = df_q.index[i]
+            radar_io = io.BytesIO()
+            line_io = io.BytesIO()
+            try:
+                row_dims = df_dims.loc[row_index, dim_cols] if dim_cols else pd.Series(dtype=float)
+                person_dims = [float(row_dims[c]) for c in dim_cols] if len(dim_cols) == 5 else []
+                if len(person_dims) == 5:
+                    _radar_chart_matplotlib(dim_cols, person_dims, radar_io, avg_vals=avg_dims)
+            except Exception:
+                pass
+            try:
+                labels, values = get_person_behavior_scores(df_q, col_to_cat_be, row_index)
+                if labels and values:
+                    _line_chart_behavior_matplotlib(labels, values, line_io, color_scheme=COLOR_SCHEME)
+            except Exception:
+                pass
+            person_details.append((name, radar_io, line_io))
+        try:
+            report = PDFReport(app_dir=_app_dir, report_type="team")
+            pdf_buf = report.build(
+                dim_means=dim_means,
+                summary_chart_png=summary_chart_png,
+                behavior_avgs=behavior_avgs,
+                behavior_chart_png=behavior_chart_png,
+                radar_images=[radar_png],
+                top3_high=top3_high,
+                top3_low=top3_low,
+                anomaly_rows=anomaly_rows,
+                names=names,
+                selected_name=selected_name,
+                summary_votes=summary_votes,
+                person_details=person_details,
+            )
+            st.session_state["pdf_report_bytes"] = pdf_buf.getvalue()
+            st.success("PDF 已生成，请点击下方下载。")
+        except Exception as e:
+            st.error("PDF 生成失败：" + str(e))
+    if "pdf_report_bytes" in st.session_state:
+        st.download_button(
+            "下载 好未来新灵秀报告.pdf",
+            data=st.session_state["pdf_report_bytes"],
+            file_name="好未来新灵秀报告.pdf",
+            key="dl_pdf",
+            use_container_width=True,
+        )
 
 # ==================== 主布局 ====================
 st.markdown(
@@ -1044,6 +1364,111 @@ with tab3:
             st.plotly_chart(fig_radar, use_container_width=True, config=PLOTLY_CONFIG)
         else:
             st.info("暂无足够维度数据，无法绘制雷达图。")
+
+    # 3. 各行为项得分折线图（整体布局：标题→说明→图表→图例，间距与字号统一）
+    st.markdown("#### 各行为项得分")
+    st.caption("模块名称居中显示在各色块正上方，中间为得分趋势，下方为行为项；y 轴 0～5.5。")
+    st.markdown("<div style='height: 6px;'></div>", unsafe_allow_html=True)  # 标题/说明与图表间距
+    try:
+        labels_line, values_line = get_person_behavior_scores(df_q, col_to_cat_be, row_index)
+        if labels_line and values_line:
+            vals = [float(v) if v is not None and str(v) != "nan" else 0.0 for v in values_line]
+            n = len(labels_line)
+            ticktext = []
+            for lab in labels_line:
+                if "-" in lab:
+                    _, be = lab.split("-", 1)
+                    ticktext.append(be)
+                else:
+                    ticktext.append(lab)
+            y_min, y_max = 0.0, 5.5
+            fig_line = go.Figure()
+            shapes = []
+            annotations = []
+            for mod in CATEGORY_ORDER:
+                indices = [i for i in range(n) if labels_line[i].startswith(mod + "-")]
+                if not indices:
+                    continue
+                y_mod = [vals[i] for i in indices]
+                color = COLOR_SCHEME.get(mod, "#2980B9")
+                text_mod = [f"{y_mod[j]:.2f}" for j in range(len(y_mod))]
+                fig_line.add_trace(go.Scatter(
+                    x=indices,
+                    y=y_mod,
+                    mode="lines+markers+text",
+                    text=text_mod,
+                    textposition="top center",
+                    textfont=dict(size=9, color=color),
+                    line=dict(color=color, width=2.5),
+                    marker=dict(size=9, color=color, line=dict(width=0.8, color="white")),
+                    name=mod,
+                ))
+                i0, i1 = min(indices), max(indices)
+                x_center = (i0 + i1) / 2.0
+                shapes.append(dict(
+                    type="rect",
+                    xref="x", yref="y",
+                    x0=i0 - 0.5, x1=i1 + 0.5,
+                    y0=y_min, y1=y_max,
+                    fillcolor=color,
+                    opacity=0.12,
+                    layer="below",
+                    line=dict(width=0),
+                ))
+                # 模块名：字体放大加粗、向上贴顶一大块
+                annotations.append(dict(
+                    x=x_center,
+                    y=0.998,
+                    xref="x",
+                    yref="paper",
+                    text=mod,
+                    showarrow=False,
+                    font=dict(size=18, color=color, family="SimHei, Microsoft YaHei Bold, PingFang SC, sans-serif"),
+                    xanchor="center",
+                    yanchor="bottom",
+                ))
+            # 四块分层：①顶部模块名 ②折线图 ③行为项 ④图例紧贴行为项下方
+            fig_line.update_layout(
+                xaxis=dict(
+                    tickmode="array",
+                    tickvals=list(range(n)),
+                    ticktext=ticktext,
+                    tickangle=-32,
+                    tickfont=dict(size=9),
+                    ticklen=4,
+                    title=None,
+                ),
+                yaxis=dict(
+                    range=[y_min, y_max],
+                    dtick=1,
+                    showgrid=True,
+                    gridcolor="#F0F0F0",
+                    title="得分",
+                    title_font=dict(size=11),
+                ),
+                height=550,
+                margin=dict(l=54, r=40, t=75, b=130),
+                showlegend=True,
+                legend=dict(
+                    orientation="h",
+                    yanchor="bottom",
+                    y=0.002,
+                    xanchor="center",
+                    x=0.5,
+                    font=dict(size=10),
+                    bgcolor="rgba(248,248,248,0.95)",
+                    bordercolor="rgba(200,200,200,0.6)",
+                    borderwidth=1,
+                ),
+                shapes=shapes,
+                annotations=annotations,
+            )
+            fig_line = apply_chart_style(fig_line)
+            st.plotly_chart(fig_line, use_container_width=True, config=PLOTLY_CONFIG)
+        else:
+            st.info("暂无行为项得分数据。")
+    except Exception as e:
+        st.warning("折线图生成失败，请确认数据完整。")
 
     # 4. 各维度详细得分（详情页：按相关性分组，卡片区隔）
     st.markdown("#### 各维度详细得分")
