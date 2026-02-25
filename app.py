@@ -7,6 +7,7 @@
 import io
 import math
 import os
+import string
 import subprocess
 import sys
 import tempfile
@@ -54,6 +55,24 @@ STOPWORDS_CN = {
     "自己", "这", "那", "等", "能", "与", "及", "或", "而", "把", "被", "让", "给",
     "无", "可以", "能够", "一些", "什么", "怎么", "如何", "为什么",
 }
+
+# 词云统计排除：标点符号（中英文及常见符号），不参与分词统计
+PUNCT_FOR_WORDCLOUD = set(string.punctuation) | set("，。！？、；：""''（）【】《》…—·～ \t\n\r")
+
+def _is_punctuation_only(s: str):
+    """判断是否为纯标点/空白，此类不纳入词云统计。"""
+    if not s or not s.strip():
+        return True
+    return all(c in PUNCT_FOR_WORDCLOUD for c in s)
+
+def _strip_punctuation_for_word(s: str):
+    """去掉首尾标点，便于「问题，」统计为「问题」。"""
+    s = s.strip()
+    while s and s[0] in PUNCT_FOR_WORDCLOUD:
+        s = s[1:]
+    while s and s[-1] in PUNCT_FOR_WORDCLOUD:
+        s = s[:-1]
+    return s.strip()
 
 # 管理痛点/问题/期待相关触发词（用于从开放反馈中筛选有效表述）
 PAIN_POINT_TRIGGERS = {
@@ -118,6 +137,26 @@ TRIGGER_DISPLAY = {
     "更多": "更多诉求",
     "加强": "更多诉求",
 }
+# 主题在页面上的展示顺序（未出现在此列表中的主题排在最后，按条数降序）
+THEME_DISPLAY_ORDER = [
+    "问题与挑战",
+    "时间与精力分配",
+    "压力与心态",
+    "辅导与反馈",
+    "沟通与协作",
+    "授权与任务分配",
+    "激励与团队",
+    "带人与管人",
+    "管理角色与转型",
+    "学习与成长",
+    "能力与方法",
+    "效率与改进",
+    "提升与完善",
+    "期待与需求",
+    "支持与指导",
+    "不足与缺乏",
+    "更多诉求",
+]
 
 def _primary_trigger(phrase: str):
     """返回短语所属的主触发词（按 TRIGGER_ORDER 第一个匹配）。"""
@@ -172,9 +211,11 @@ def _summarise_pain_point_phrases(phrases: list):
     # 每个主题去重、取代表
     out = []
     for theme, plist in theme_to_phrases.items():
-        reprs = _dedupe_similar(plist, max_repr=2, sim_threshold=0.55)
+        reprs = _dedupe_similar(plist, max_repr=4, sim_threshold=0.55)
         out.append((theme, len(plist), reprs))
-    out.sort(key=lambda x: -x[1])
+    # 按 THEME_DISPLAY_ORDER 排序，未在列表中的主题按条数降序排在最后
+    order_idx = {t: i for i, t in enumerate(THEME_DISPLAY_ORDER)}
+    out.sort(key=lambda x: (order_idx.get(x[0], len(THEME_DISPLAY_ORDER)), -x[1]))
     return out
 
 def _extract_pain_point_phrases(text: str, max_phrases: int = 30):
@@ -203,16 +244,25 @@ def _extract_pain_point_phrases(text: str, max_phrases: int = 30):
     return out
 
 def _extract_pain_point_keywords(phrases: list, top_n: int = 20, min_word_len: int = 1):
-    """仅在管理痛点相关片段中统计词频，返回 (词, 频次) 列表。min_word_len=1 时允许单字词（过滤停用单字）。"""
+    """仅在管理痛点相关片段中统计词频，返回 (词, 频次) 列表。标点不纳入统计。"""
     if not phrases:
         return []
     combined = " ".join(phrases)
     segs = jieba.lcut(combined)
     single_char_stop = {"的", "了", "是", "在", "我", "有", "和", "就", "不", "人", "都", "一", "上", "也", "很", "到", "说", "要", "去", "你", "会", "着", "没", "看", "好", "自", "这", "那", "等", "能", "与", "及", "或", "而", "把", "被", "让", "给", "无", "可", "以", "够", "些", "什", "么", "怎", "如", "为"}
-    if min_word_len <= 1:
-        words = [w for w in segs if w.strip() and w not in STOPWORDS_CN and (len(w) >= 2 or (len(w) == 1 and w not in single_char_stop))]
-    else:
-        words = [w for w in segs if len(w) >= min_word_len and w.strip() and w not in STOPWORDS_CN]
+    words = []
+    for w in segs:
+        w = _strip_punctuation_for_word(w)
+        if _is_punctuation_only(w) or not w:
+            continue
+        if w in STOPWORDS_CN:
+            continue
+        if min_word_len <= 1:
+            if len(w) >= 2 or (len(w) == 1 and w not in single_char_stop):
+                words.append(w)
+        else:
+            if len(w) >= min_word_len:
+                words.append(w)
     freq = Counter(words)
     return freq.most_common(top_n)
 
@@ -354,12 +404,26 @@ def build_wordcloud_image(text: str, width=900, height=380, mask_dir: str = None
         return None, [], None
     segs = jieba.lcut(text)
     single_char_stop = {"的", "了", "是", "在", "我", "有", "和", "就", "不", "人", "都", "一", "上", "也", "很", "到", "说", "要", "去", "你", "会", "着", "没", "看", "好", "自", "这", "那", "等", "能", "与", "及", "或", "而", "把", "被", "让", "给", "无", "可", "以", "够", "些", "什", "么", "怎", "如", "为"}
-    if min_word_length <= 1:
-        words = [w for w in segs if w.strip() and w not in STOPWORDS_CN and (len(w) >= 2 or (len(w) == 1 and w not in single_char_stop))]
-    else:
-        words = [w for w in segs if len(w) >= min_word_length and w not in STOPWORDS_CN and w.strip()]
+    words = []
+    for w in segs:
+        w = _strip_punctuation_for_word(w)
+        if _is_punctuation_only(w) or not w:
+            continue
+        if w in STOPWORDS_CN:
+            continue
+        if min_word_length <= 1:
+            if len(w) >= 2 or (len(w) == 1 and w not in single_char_stop):
+                words.append(w)
+        else:
+            if len(w) >= min_word_length:
+                words.append(w)
     if not words and len(text) >= 2:
-        words = [w for w in segs if w.strip() and w not in STOPWORDS_CN and (len(w) >= min_word_length or (min_word_length <= 1 and len(w) == 1 and w not in single_char_stop))]
+        for w in segs:
+            w = _strip_punctuation_for_word(w)
+            if _is_punctuation_only(w) or not w or w in STOPWORDS_CN:
+                continue
+            if len(w) >= min_word_length or (min_word_length <= 1 and len(w) == 1 and w not in single_char_stop):
+                words.append(w)
     if not words:
         return None, [], None
     freq = Counter(words)
@@ -1942,74 +2006,13 @@ with tab4:
         if open_df.empty:
             st.caption("暂无有效开放反馈（已填写「无」或为空的记录不展示）")
         else:
-            all_text_parts = []
-            for _, row in open_df.iterrows():
-                for c in open_cols:
-                    val = str(row[c]).strip()
-                    if val and val not in ("无", "-", "—"):
-                        all_text_parts.append(val)
-            combined_text = " ".join(all_text_parts)
-            _app_dir = os.path.dirname(os.path.abspath(__file__))
-
-            # 管理痛点与问题聚焦：按主题分组、去重后做结论式总结
-            pain_phrases = _extract_pain_point_phrases(combined_text, max_phrases=50)
-            pain_summaries = _summarise_pain_point_phrases(pain_phrases)
-            pain_keywords = _extract_pain_point_keywords(pain_phrases, top_n=20, min_word_len=1)
-
-            st.markdown("##### 管理痛点与问题聚焦")
-            st.caption("基于伙伴开放反馈中与管理痛点、问题、期待相关的表述进行归纳总结，便于针对性设计培训。")
-            if pain_summaries:
-                for theme, count, reprs in pain_summaries:
-                    st.markdown(f"**{theme}**（共 {count} 条相关反馈）")
-                    if reprs:
-                        repr_str = "；".join(f"「{r}」" for r in reprs if r)
-                        st.markdown(f"代表性表述：{repr_str}")
-                    st.markdown("")
-            else:
-                st.info("未从当前反馈中识别到与管理痛点/问题/期待相关的表述，可查看下方填写明细。")
-
-            st.markdown("---")
-            # 左右布局：左侧为「与管理问题相关」的词云 + 关键词，右侧填写明细
-            col_wc, col_detail = st.columns([1, 2])
-            with col_wc:
-                st.markdown("##### 管理问题相关词云")
-                st.caption("仅基于与管理问题、期待相关的反馈内容生成，便于了解群体普遍希望解决和改善的问题。")
-                text_for_wc = " ".join(pain_phrases) if pain_phrases else combined_text
-                wc_buf, top_keywords, wc_err = build_wordcloud_image(
-                    text_for_wc, width=420, height=320, mask_dir=_app_dir, min_word_length=1
-                )
-                if not wc_buf and len(text_for_wc.strip()) > 20:
-                    wc_buf, top_keywords, wc_err = build_wordcloud_image(
-                        text_for_wc, width=420, height=320, mask_dir=_app_dir, use_mask=False, min_word_length=1
-                    )
-                if wc_buf:
-                    st.image(wc_buf, use_container_width=True)
-                else:
-                    st.caption("反馈内容过少或暂无痛点相关表述，暂无法生成词云。")
-                    if wc_err:
-                        with st.expander("词云生成失败原因（可截图反馈）"):
-                            st.code(wc_err, language=None)
-                if pain_keywords:
-                    st.markdown(
-                        '<p style="font-size:13px; color:rgba(0,0,0,0.65); margin-top:12px;">'
-                        '<strong>痛点相关关键词</strong>（来自上方归纳表述）</p>',
-                        unsafe_allow_html=True,
-                    )
-                    st.markdown(
-                        '<p style="font-size:13px; color:rgba(0,0,0,0.88); margin-top:4px;">'
-                        + "　".join(f'<span style="color:#c5221f;">{w}</span>（{c}）' for w, c in pain_keywords[:14]) +
-                        '</p>',
-                        unsafe_allow_html=True,
-                    )
-
-            with col_detail:
-                st.markdown("##### 填写明细")
-                col_config = {
-                    name_col_df: st.column_config.TextColumn(name_col_df, width=85),
-                    **({dept_col: st.column_config.TextColumn(dept_col, width=85)} if dept_col else {}),
-                    **{c: st.column_config.TextColumn(c, width="large") for c in open_cols},
-                }
-                st.dataframe(open_df, use_container_width=True, hide_index=True, column_config=col_config)
+            st.markdown("##### 填写明细")
+            col_config = {
+                name_col_df: st.column_config.TextColumn(name_col_df, width=85),
+                **({dept_col: st.column_config.TextColumn(dept_col, width=85)} if dept_col else {}),
+                **{c: st.column_config.TextColumn(c, width="large") for c in open_cols},
+            }
+            st.dataframe(open_df, use_container_width=True, hide_index=True, column_config=col_config)
 
 # ---------- Tab 5: 异常提醒 ----------
 with tab5:
