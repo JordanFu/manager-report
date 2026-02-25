@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.request
-from collections import Counter
+from collections import Counter, defaultdict
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
@@ -33,6 +33,9 @@ from config import (
     BASIC_INFO_DISPLAY,
     OPEN_QUESTION_COLS,
     LEARNING_MODULE_COL,
+    TENURE_COL,
+    TEAM_SIZE_COL,
+    SURVEY_QUESTIONS,
 )
 from data_processor import (
     clean_and_score,
@@ -49,8 +52,169 @@ STOPWORDS_CN = {
     "的", "了", "是", "在", "我", "有", "和", "就", "不", "人", "都", "一", "一个",
     "上", "也", "很", "到", "说", "要", "去", "你", "会", "着", "没有", "看", "好",
     "自己", "这", "那", "等", "能", "与", "及", "或", "而", "把", "被", "让", "给",
-    "无", "希望", "可以", "能够", "更多", "一些", "什么", "怎么", "如何", "为什么",
+    "无", "可以", "能够", "一些", "什么", "怎么", "如何", "为什么",
 }
+
+# 管理痛点/问题/期待相关触发词（用于从开放反馈中筛选有效表述）
+PAIN_POINT_TRIGGERS = {
+    "难", "不足", "缺乏", "希望", "需要", "问题", "挑战", "压力", "不够", "改善", "提升",
+    "困惑", "不知道", "平衡", "时间", "精力", "带人", "管人", "辅导", "反馈", "授权",
+    "激励", "任务", "沟通", "下属", "团队", "学习", "成长", "期待", "担心", "焦虑",
+    "协调", "冲突", "效率", "方法", "技巧", "经验", "能力", "加强", "更多", "管理",
+    "改进", "完善", "支持", "帮助", "指导", "培养", "发展", "角色", "转型",
+}
+# 按长度降序，用于分组时优先匹配长触发词（如「任务分配」先于「任务」）
+TRIGGER_ORDER = sorted(PAIN_POINT_TRIGGERS, key=len, reverse=True)
+# 触发词 -> 结论中的主题展示名
+TRIGGER_DISPLAY = {
+    "时间": "时间与精力分配",
+    "精力": "时间与精力分配",
+    "平衡": "时间与精力分配",
+    "压力": "压力与心态",
+    "焦虑": "压力与心态",
+    "担心": "压力与心态",
+    "辅导": "辅导与反馈",
+    "反馈": "辅导与反馈",
+    "沟通": "沟通与协作",
+    "协调": "沟通与协作",
+    "冲突": "沟通与协作",
+    "授权": "授权与任务分配",
+    "任务": "授权与任务分配",
+    "激励": "激励与团队",
+    "团队": "激励与团队",
+    "下属": "激励与团队",
+    "带人": "带人与管人",
+    "管人": "带人与管人",
+    "管理": "管理角色与转型",
+    "角色": "管理角色与转型",
+    "转型": "管理角色与转型",
+    "学习": "学习与成长",
+    "成长": "学习与成长",
+    "能力": "能力与方法",
+    "方法": "能力与方法",
+    "技巧": "能力与方法",
+    "经验": "能力与方法",
+    "效率": "效率与改进",
+    "改善": "效率与改进",
+    "改进": "效率与改进",
+    "提升": "提升与完善",
+    "完善": "提升与完善",
+    "希望": "期待与需求",
+    "需要": "期待与需求",
+    "期待": "期待与需求",
+    "支持": "支持与指导",
+    "帮助": "支持与指导",
+    "指导": "支持与指导",
+    "培养": "支持与指导",
+    "发展": "支持与指导",
+    "问题": "问题与挑战",
+    "挑战": "问题与挑战",
+    "困惑": "问题与挑战",
+    "不知道": "问题与挑战",
+    "难": "问题与挑战",
+    "不足": "不足与缺乏",
+    "缺乏": "不足与缺乏",
+    "不够": "不足与缺乏",
+    "更多": "更多诉求",
+    "加强": "更多诉求",
+}
+
+def _primary_trigger(phrase: str):
+    """返回短语所属的主触发词（按 TRIGGER_ORDER 第一个匹配）。"""
+    for t in TRIGGER_ORDER:
+        if t in phrase:
+            return t
+    return None
+
+def _dedupe_similar(phrases: list, max_repr: int = 2, sim_threshold: int = 0.6):
+    """去重相似表述，保留最多 max_repr 条代表性表述。优先保留较完整（较长）的表述。"""
+    if not phrases:
+        return []
+    sorted_p = sorted(phrases, key=len, reverse=True)
+    kept = []
+    for p in sorted_p:
+        p_clean = p.strip()
+        if len(p_clean) < 3:
+            continue
+        is_dup = False
+        for k in kept:
+            if p_clean in k or k in p_clean:
+                is_dup = True
+                break
+            set_p, set_k = set(p_clean), set(k)
+            overlap = len(set_p & set_k) / max(len(set_p), len(set_k), 1)
+            if overlap >= sim_threshold:
+                is_dup = True
+                break
+        if not is_dup:
+            kept.append(p_clean)
+        if len(kept) >= max_repr:
+            break
+    return kept[:max_repr]
+
+def _summarise_pain_point_phrases(phrases: list):
+    """
+    将痛点相关表述按主题分组、去重后，生成结论式总结。
+    返回 [(主题展示名, 该主题条数, 代表性表述列表), ...]，按条数降序。
+    """
+    if not phrases:
+        return []
+    by_trigger = defaultdict(list)
+    for p in phrases:
+        t = _primary_trigger(p)
+        if t:
+            by_trigger[t].append(p)
+    # 合并到统一主题名
+    theme_to_phrases = defaultdict(list)
+    for t, plist in by_trigger.items():
+        theme = TRIGGER_DISPLAY.get(t, t)
+        theme_to_phrases[theme].extend(plist)
+    # 每个主题去重、取代表
+    out = []
+    for theme, plist in theme_to_phrases.items():
+        reprs = _dedupe_similar(plist, max_repr=2, sim_threshold=0.55)
+        out.append((theme, len(plist), reprs))
+    out.sort(key=lambda x: -x[1])
+    return out
+
+def _extract_pain_point_phrases(text: str, max_phrases: int = 30):
+    """
+    从反馈全文里筛出包含「管理痛点/问题/期待」相关词的句子或片段，用于聚焦呈现。
+    按句切分（。！？；\\n），保留含触发词的片段，去重后返回列表。
+    """
+    if not (text or "").strip():
+        return []
+    import re
+    raw = re.sub(r"[。！？；]", "\n", text)
+    raw = re.sub(r"\n+", "\n", raw).strip()
+    segments = [s.strip() for s in raw.split("\n") if len(s.strip()) >= 4]
+    out = []
+    seen = set()
+    for s in segments:
+        if len(out) >= max_phrases:
+            break
+        for t in PAIN_POINT_TRIGGERS:
+            if t in s:
+                key = s[:50]
+                if key not in seen:
+                    seen.add(key)
+                    out.append(s)
+                break
+    return out
+
+def _extract_pain_point_keywords(phrases: list, top_n: int = 20, min_word_len: int = 1):
+    """仅在管理痛点相关片段中统计词频，返回 (词, 频次) 列表。min_word_len=1 时允许单字词（过滤停用单字）。"""
+    if not phrases:
+        return []
+    combined = " ".join(phrases)
+    segs = jieba.lcut(combined)
+    single_char_stop = {"的", "了", "是", "在", "我", "有", "和", "就", "不", "人", "都", "一", "上", "也", "很", "到", "说", "要", "去", "你", "会", "着", "没", "看", "好", "自", "这", "那", "等", "能", "与", "及", "或", "而", "把", "被", "让", "给", "无", "可", "以", "够", "些", "什", "么", "怎", "如", "为"}
+    if min_word_len <= 1:
+        words = [w for w in segs if w.strip() and w not in STOPWORDS_CN and (len(w) >= 2 or (len(w) == 1 and w not in single_char_stop))]
+    else:
+        words = [w for w in segs if len(w) >= min_word_len and w.strip() and w not in STOPWORDS_CN]
+    freq = Counter(words)
+    return freq.most_common(top_n)
 
 def _font_candidates_in_dir(directory: str):
     """在指定目录下生成 fonts/ 中字体候选路径。Pillow/WordCloud 仅可靠支持 TTF，优先 TTF。"""
@@ -179,23 +343,27 @@ def _load_wordcloud_mask_and_overlay(app_dir: str, width=900, height=380, charac
         return None, None
 
 
-def build_wordcloud_image(text: str, width=900, height=380, mask_dir: str = None, use_mask: bool = True):
+def build_wordcloud_image(text: str, width=900, height=380, mask_dir: str = None, use_mask: bool = True, min_word_length: int = 2):
     """
     根据反馈文本生成词云图：红/橙配色，可选文字围绕卡通形象（保持比例）。
-    use_mask=False 时仅用 mask_dir 取字体，不加载蒙版（便于蒙版异常时回退）。
+    min_word_length：最小词长，1 时允许单字（会过滤无意义单字），便于呈现「难」「力」等与管理问题相关的词。
     返回 (PNG 字节流, 高频词列表, 错误信息)；成功时错误信息为 None。
     """
     text = (text or "").strip()
     if not text:
         return None, [], None
     segs = jieba.lcut(text)
-    words = [w for w in segs if len(w) >= 2 and w not in STOPWORDS_CN and w.strip()]
+    single_char_stop = {"的", "了", "是", "在", "我", "有", "和", "就", "不", "人", "都", "一", "上", "也", "很", "到", "说", "要", "去", "你", "会", "着", "没", "看", "好", "自", "这", "那", "等", "能", "与", "及", "或", "而", "把", "被", "让", "给", "无", "可", "以", "够", "些", "什", "么", "怎", "如", "为"}
+    if min_word_length <= 1:
+        words = [w for w in segs if w.strip() and w not in STOPWORDS_CN and (len(w) >= 2 or (len(w) == 1 and w not in single_char_stop))]
+    else:
+        words = [w for w in segs if len(w) >= min_word_length and w not in STOPWORDS_CN and w.strip()]
     if not words and len(text) >= 2:
-        words = [w for w in segs if w.strip() and w not in STOPWORDS_CN and len(w) >= 1]
+        words = [w for w in segs if w.strip() and w not in STOPWORDS_CN and (len(w) >= min_word_length or (min_word_length <= 1 and len(w) == 1 and w not in single_char_stop))]
     if not words:
         return None, [], None
     freq = Counter(words)
-    top_words = [w for w, _ in freq.most_common(20)]
+    top_words = [w for w, _ in freq.most_common(25)]
     # 线下=__file__ 目录，线上=再试 getcwd，保证能找到 fonts/
     font_path = _get_chinese_font_path(mask_dir)
     mask, overlay_img = None, None
@@ -663,9 +831,40 @@ PLOTLY_CONFIG = {
     "displaylogo": False,
 }
 
-def _radar_chart_matplotlib(dim_labels, person_vals, out_buffer, avg_vals=None):
+def _set_matplotlib_chinese_font(app_dir=None):
+    """
+    为 matplotlib 设置中文字体，避免 PDF 导出图表在云端/无中文字体环境下乱码。
+    优先使用应用目录 fonts/ 下字体（TTF/OTF），再回退到 _get_chinese_font_path。
+    """
+    candidates = []
+    if app_dir:
+        for name in ("NotoSansSC-Regular.ttf", "font.ttf", "NotoSansSC-Regular.otf", "NotoSansCJK-Regular.ttc"):
+            p = os.path.join(app_dir, "fonts", name)
+            if os.path.isfile(p):
+                candidates.append(p)
+    path = None
+    for p in candidates:
+        path = p
+        break
+    if not path:
+        path = _get_chinese_font_path(app_dir)
+    if not path or not os.path.isfile(path):
+        return
+    try:
+        import matplotlib.font_manager as fm
+        fm.fontManager.addfont(path)
+        prop = fm.FontProperties(fname=path)
+        name = prop.get_name()
+        plt.rcParams["font.sans-serif"] = [name, "SimHei", "PingFang SC", "Microsoft YaHei", "DejaVu Sans", "sans-serif"]
+        plt.rcParams["axes.unicode_minus"] = False
+    except Exception:
+        pass
+
+
+def _radar_chart_matplotlib(dim_labels, person_vals, out_buffer, avg_vals=None, app_dir=None):
     """用 matplotlib 绘制五维度雷达图。可叠加全员平均线对比。dim_labels 与 person_vals 长度均为 5。"""
-    plt.rcParams["font.sans-serif"] = ["SimHei", "PingFang SC", "Microsoft YaHei", "DejaVu Sans", "sans-serif"]
+    _set_matplotlib_chinese_font(app_dir)
+    plt.rcParams["font.sans-serif"] = plt.rcParams.get("font.sans-serif", ["SimHei", "PingFang SC", "Microsoft YaHei", "DejaVu Sans", "sans-serif"])
     plt.rcParams["axes.unicode_minus"] = False
     n = len(dim_labels)
     if n == 0:
@@ -710,9 +909,10 @@ def _radar_chart_matplotlib(dim_labels, person_vals, out_buffer, avg_vals=None):
     out_buffer.seek(0)
 
 
-def _line_chart_behavior_matplotlib(labels, values, out_buffer, color_scheme=None):
+def _line_chart_behavior_matplotlib(labels, values, out_buffer, color_scheme=None, app_dir=None):
     """用 matplotlib 绘制模块+行为项得分折线图。x=模块-行为项，y=得分；按模块着色，y 轴随数据范围以突出趋势。"""
-    plt.rcParams["font.sans-serif"] = ["SimHei", "PingFang SC", "Microsoft YaHei", "DejaVu Sans", "sans-serif"]
+    _set_matplotlib_chinese_font(app_dir)
+    plt.rcParams["font.sans-serif"] = plt.rcParams.get("font.sans-serif", ["SimHei", "PingFang SC", "Microsoft YaHei", "DejaVu Sans", "sans-serif"])
     plt.rcParams["axes.unicode_minus"] = False
     fig, ax = plt.subplots(figsize=(9, 4.5))
     x_pos = list(range(len(labels)))
@@ -756,9 +956,10 @@ def _line_chart_behavior_matplotlib(labels, values, out_buffer, color_scheme=Non
     out_buffer.seek(0)
 
 
-def _summary_chart_matplotlib(dims, scores, bar_colors, out_buffer):
+def _summary_chart_matplotlib(dims, scores, bar_colors, out_buffer, app_dir=None):
     """用 matplotlib 绘制五维度得分柱状图并写入 out_buffer（kaleido 不可用时的备选）。"""
-    plt.rcParams["font.sans-serif"] = ["SimHei", "PingFang SC", "Microsoft YaHei", "DejaVu Sans", "sans-serif"]
+    _set_matplotlib_chinese_font(app_dir)
+    plt.rcParams["font.sans-serif"] = plt.rcParams.get("font.sans-serif", ["SimHei", "PingFang SC", "Microsoft YaHei", "DejaVu Sans", "sans-serif"])
     plt.rcParams["axes.unicode_minus"] = False
     fig, ax = plt.subplots(figsize=(10, 4))
     x_pos = range(len(dims))
@@ -774,6 +975,27 @@ def _summary_chart_matplotlib(dims, scores, bar_colors, out_buffer):
         ax.text(b.get_x() + b.get_width() / 2, b.get_height() + 0.08, "%.2f" % v, ha="center", va="bottom", fontsize=10)
     fig.tight_layout()
     fig.savefig(out_buffer, format="png", dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    out_buffer.seek(0)
+
+
+def _pie_chart_matplotlib(labels, values, colors, title: str, out_buffer, app_dir=None):
+    """用 matplotlib 绘制饼图并写入 out_buffer，用于 PDF 摘要页。labels/values/colors 同长，title 为图标题。"""
+    if not labels or not values or len(labels) != len(values):
+        return
+    _set_matplotlib_chinese_font(app_dir)
+    plt.rcParams["font.sans-serif"] = plt.rcParams.get("font.sans-serif", ["SimHei", "PingFang SC", "Microsoft YaHei", "DejaVu Sans", "sans-serif"])
+    plt.rcParams["axes.unicode_minus"] = False
+    # 使用较大 figsize + 高 dpi，避免 PDF 中嵌入时模糊
+    fig, ax = plt.subplots(figsize=(3.8, 3.6))
+    cols = colors if len(colors) >= len(labels) else (colors * ((len(labels) // len(colors)) + 1))[:len(labels)]
+    wedges, _, autotexts = ax.pie(values, labels=labels, colors=cols, autopct="%1.0f%%", startangle=90, textprops={"fontsize": 8})
+    for t in autotexts:
+        t.set_fontsize(7)
+    if title:
+        ax.set_title(title, fontsize=10)
+    fig.tight_layout()
+    fig.savefig(out_buffer, format="png", dpi=200, bbox_inches="tight")
     plt.close(fig)
     out_buffer.seek(0)
 
@@ -848,7 +1070,47 @@ col_to_cat_be = data["col_to_cat_be"]
 names = data["names"]
 total = data["total"]
 
-# ---------- 说明中间页：需管理者确认后进入报告（左文右表） ----------
+# 多选「希望深入学习的技能模块」统计（全局概览 + PDF 共用）
+learning_col = LEARNING_MODULE_COL if LEARNING_MODULE_COL in df.columns else next(
+    (c for c in df.columns if "技能模块" in str(c) and "深入" in str(c)), None
+)
+learning_module_votes = []
+if learning_col is not None:
+    _counts = Counter()
+    for val in df[learning_col].dropna().astype(str):
+        _v = val
+        for sep in ["，", "、", "；", ";", ",", "\n"]:
+            _v = _v.replace(sep, "\t")
+        for part in _v.split("\t"):
+            token = part.strip()
+            if token in CATEGORY_ORDER:
+                _counts[token] += 1
+    learning_module_votes = sorted(_counts.items(), key=lambda x: -x[1])
+
+# 管理年限分布统计（全局概览）
+tenure_col = TENURE_COL if TENURE_COL in df.columns else next(
+    (c for c in df.columns if "带团队" in str(c) and "多久" in str(c)), None
+)
+tenure_votes = []
+if tenure_col is not None:
+    s = df[tenure_col].fillna("未填写").astype(str).str.strip()
+    s = s.replace("", "未填写").replace("nan", "未填写")
+    vc = s.value_counts()
+    tenure_votes = [(str(k), int(v)) for k, v in vc.items() if str(k).strip()]
+    tenure_votes.sort(key=lambda x: -x[1])
+
+# 团队规模分布统计（全局概览）
+team_size_col = TEAM_SIZE_COL if TEAM_SIZE_COL in df.columns else next(
+    (c for c in df.columns if "汇报" in str(c) and "伙伴" in str(c)), None
+)
+team_size_votes = []
+if team_size_col is not None:
+    s = df[team_size_col].fillna("未填写").astype(str).str.strip()
+    s = s.replace("", "未填写").replace("nan", "未填写")
+    vc = s.value_counts()
+    team_size_votes = [(str(k), int(v)) for k, v in vc.items() if str(k).strip()]
+    team_size_votes.sort(key=lambda x: -x[1])
+
 if st.session_state.get("disclaimer_confirmed", False) is not True:
     st.markdown("## 在您阅读报告之前，请您知悉")
     st.markdown("")
@@ -953,172 +1215,167 @@ with st.sidebar:
             else:
                 st.error("安装失败。请在终端执行：**" + sys.executable + " -m pip install reportlab**\n\n" + (r.stderr or r.stdout or ""))
     elif st.button("📥 生成 PDF 报告", key="gen_pdf", use_container_width=True):
-        _app_dir = os.path.dirname(os.path.abspath(__file__))
-        dim_cols = [c for c in CATEGORY_ORDER if c in df_dims.columns]
-        dim_means = [(c, float(df_dims[c].mean())) for c in dim_cols]
-        behavior_avgs = get_behavior_avg_by_dimension(df_q, col_to_cat_be)
-        summary_chart_png = io.BytesIO()
-        radar_png = io.BytesIO()
-        summary = pd.DataFrame({"维度": [x[0] for x in dim_means], "全员平均分": [x[1] for x in dim_means]})
-        dims = summary["维度"].tolist()
-        scores = summary["全员平均分"].values
-        bar_colors = [COLOR_SCHEME.get(d, "#3498db") for d in dims]
-        try:
-            fig_summary = go.Figure(data=[go.Bar(
-                x=dims,
-                y=summary["全员平均分"],
-                marker_color=bar_colors,
-                text=summary["全员平均分"].round(2),
-                texttemplate="%{text:.2f}",
-                textposition="outside",
-                textfont=dict(size=12),
-            )])
-            fig_summary.update_layout(
-                xaxis_title="维度",
-                yaxis_title="得分",
-                yaxis=dict(range=[0, 5.5], dtick=1, showgrid=True, gridcolor="#e8e8e8"),
-                height=340,
-                margin=dict(b=100, t=50, l=60, r=40),
-                showlegend=False,
-            )
-            fig_summary.update_xaxes(tickangle=-25, tickfont=dict(size=11))
-            fig_summary = apply_chart_style(fig_summary)
-            try:
-                img_bytes = fig_summary.to_image(format="png", engine="kaleido")
-                summary_chart_png.write(img_bytes)
-            except Exception:
-                try:
-                    fig_summary.write_image(summary_chart_png, format="png", engine="kaleido")
-                except Exception:
-                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                        try:
-                            fig_summary.write_image(tmp.name, format="png", engine="kaleido")
-                            with open(tmp.name, "rb") as f:
-                                summary_chart_png.write(f.read())
-                        finally:
-                            try:
-                                os.unlink(tmp.name)
-                            except Exception:
-                                pass
-            summary_chart_png.seek(0)
-        except Exception:
+        with st.spinner("报告正在生成中，请稍候…"):
+            _app_dir = os.path.dirname(os.path.abspath(__file__))
+            dim_cols = [c for c in CATEGORY_ORDER if c in df_dims.columns]
+            dim_means = [(c, float(df_dims[c].mean())) for c in dim_cols]
+            behavior_avgs = get_behavior_avg_by_dimension(df_q, col_to_cat_be)
             summary_chart_png = io.BytesIO()
-        if len(summary_chart_png.getvalue()) == 0:
-            try:
-                _summary_chart_matplotlib(dims, scores, bar_colors, summary_chart_png)
-            except Exception:
-                pass
-        summary_chart_png.seek(0)
-        behavior_chart_png = io.BytesIO()
-        try:
-            labels_avg, values_avg = get_all_behavior_avgs(df_q, col_to_cat_be)
-            if labels_avg and values_avg:
-                _line_chart_behavior_matplotlib(labels_avg, values_avg, behavior_chart_png, color_scheme=COLOR_SCHEME)
-        except Exception:
-            pass
-        behavior_chart_png.seek(0)
-        try:
-            idx = names.index(selected_name)
-            row_index = df_q.index[idx]
-            row_dims = df_dims.loc[row_index, dim_cols] if dim_cols else pd.Series(dtype=float)
-            dim_means_all = df_dims[dim_cols].mean() if dim_cols else pd.Series(dtype=float)
-            theta_radar = dim_cols
-            r_person = [float(row_dims[c]) for c in theta_radar]
-            r_avg = [float(dim_means_all[c]) for c in theta_radar]
-            if len(r_person) == 5:
-                fig_radar = go.Figure()
-                fig_radar.add_trace(go.Scatterpolar(
-                    r=r_person + [r_person[0]], theta=theta_radar + [theta_radar[0]],
-                    fill="toself", fillcolor="rgba(52, 152, 219, 0.35)", line=dict(color="#3498DB", width=2),
-                    name=selected_name,
-                ))
-                fig_radar.add_trace(go.Scatterpolar(
-                    r=r_avg + [r_avg[0]], theta=theta_radar + [theta_radar[0]],
-                    fill="toself", fillcolor="rgba(200,200,200,0.2)", line=dict(color="#94a3b8", width=1.5, dash="dash"),
-                    name="全员均分",
-                ))
-                fig_radar.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 5.5])), showlegend=True, height=400)
-                fig_radar = apply_chart_style(fig_radar)
-                try:
-                    radar_png.write(fig_radar.to_image(format="png", engine="kaleido"))
-                except Exception:
-                    fig_radar.write_image(radar_png, format="png", engine="kaleido")
-                radar_png.seek(0)
-        except Exception:
             radar_png = io.BytesIO()
-        person_scores = list(zip(names, [float(total.loc[df_q.index[i]]) for i in range(len(df_q))]))
-        person_scores.sort(key=lambda x: x[1], reverse=True)
-        top3_high = person_scores[:3]
-        top3_low = person_scores[-3:][::-1] if len(person_scores) >= 3 else person_scores[::-1]
-        score_cols = list(col_to_cat_be.keys())
-        anomaly_rows = []
-        name_col_anom = next((c for c in ["填写人", "姓名", "学员姓名"] if c in df.columns), None)
-        dept_col_anom = "部门" if "部门" in df.columns else None
-        for idx in df_q.index:
-            row = df_q.loc[idx, score_cols]
-            valid = row.dropna()
-            if len(valid) >= 1 and valid.nunique() == 1:
-                uniform_score = float(valid.iloc[0])
-                name = df.loc[idx, name_col_anom] if name_col_anom else str(idx)
-                dept = df.loc[idx, dept_col_anom] if dept_col_anom else None
-                note = f"该伙伴所有题目均为 {uniform_score:.1f} 分，建议管理者关注。"
-                anomaly_rows.append((name, dept, uniform_score, note))
-        summary_votes = []
-        learning_col = LEARNING_MODULE_COL if LEARNING_MODULE_COL in df.columns else next(
-            (c for c in df.columns if "技能模块" in str(c) and "深入" in str(c)), None
-        )
-        if learning_col is not None:
-            counts = Counter()
-            for val in df[learning_col].dropna().astype(str):
-                for sep in ["，", "、", "；", ";", ",", "\n"]:
-                    val = val.replace(sep, "\t")
-                for part in val.split("\t"):
-                    token = part.strip()
-                    if token in CATEGORY_ORDER:
-                        counts[token] += 1
-            summary_votes = sorted(counts.items(), key=lambda x: -x[1])
-        dim_means_all = df_dims[dim_cols].mean() if dim_cols else pd.Series(dtype=float)
-        avg_dims = [float(dim_means_all[c]) for c in dim_cols] if len(dim_cols) == 5 else None
-        person_details = []
-        for i in range(len(names)):
-            name = names[i]
-            row_index = df_q.index[i]
-            radar_io = io.BytesIO()
-            line_io = io.BytesIO()
+            summary = pd.DataFrame({"维度": [x[0] for x in dim_means], "全员平均分": [x[1] for x in dim_means]})
+            dims = summary["维度"].tolist()
+            scores = summary["全员平均分"].values
+            bar_colors = [COLOR_SCHEME.get(d, "#3498db") for d in dims]
+            # PDF 导出优先用 matplotlib 生成图表，确保云端/多设备下中文字体正确显示，避免 kaleido 无中文字体乱码
             try:
+                _summary_chart_matplotlib(dims, scores, bar_colors, summary_chart_png, app_dir=_app_dir)
+            except Exception:
+                try:
+                    fig_summary = go.Figure(data=[go.Bar(
+                        x=dims,
+                        y=summary["全员平均分"],
+                        marker_color=bar_colors,
+                        text=summary["全员平均分"].round(2),
+                        texttemplate="%{text:.2f}",
+                        textposition="outside",
+                        textfont=dict(size=12),
+                    )])
+                    fig_summary.update_layout(
+                        xaxis_title="维度",
+                        yaxis_title="得分",
+                        yaxis=dict(range=[0, 5.5], dtick=1, showgrid=True, gridcolor="#e8e8e8"),
+                        height=340,
+                        margin=dict(b=100, t=50, l=60, r=40),
+                        showlegend=False,
+                    )
+                    fig_summary.update_xaxes(tickangle=-25, tickfont=dict(size=11))
+                    fig_summary = apply_chart_style(fig_summary)
+                    img_bytes = fig_summary.to_image(format="png", engine="kaleido")
+                    summary_chart_png.write(img_bytes)
+                except Exception:
+                    pass
+            summary_chart_png.seek(0)
+            if len(summary_chart_png.getvalue()) == 0:
+                try:
+                    _summary_chart_matplotlib(dims, scores, bar_colors, summary_chart_png, app_dir=_app_dir)
+                except Exception:
+                    pass
+            summary_chart_png.seek(0)
+            behavior_chart_png = io.BytesIO()
+            try:
+                labels_avg, values_avg = get_all_behavior_avgs(df_q, col_to_cat_be)
+                if labels_avg and values_avg:
+                    _line_chart_behavior_matplotlib(labels_avg, values_avg, behavior_chart_png, color_scheme=COLOR_SCHEME, app_dir=_app_dir)
+            except Exception:
+                pass
+            behavior_chart_png.seek(0)
+            # 三个饼图（希望深入学习的技能模块、管理年限、团队规模），放在报告摘要柱状图下方
+            pie_learning_png = io.BytesIO()
+            pie_tenure_png = io.BytesIO()
+            pie_team_png = io.BytesIO()
+            if learning_module_votes:
+                mod_names = [x[0] for x in learning_module_votes]
+                mod_counts = [x[1] for x in learning_module_votes]
+                pie_colors = [COLOR_SCHEME.get(m, "#3498db") for m in mod_names]
+                try:
+                    _pie_chart_matplotlib(mod_names, mod_counts, pie_colors, "", pie_learning_png, app_dir=_app_dir)
+                except Exception:
+                    pass
+            if tenure_votes:
+                tenure_labels = [x[0] for x in tenure_votes]
+                tenure_counts = [x[1] for x in tenure_votes]
+                tenure_colors = [COLORS_BARS[i % len(COLORS_BARS)] for i in range(len(tenure_labels))]
+                try:
+                    _pie_chart_matplotlib(tenure_labels, tenure_counts, tenure_colors, "管理年限分布", pie_tenure_png, app_dir=_app_dir)
+                except Exception:
+                    pass
+            if team_size_votes:
+                team_labels = [x[0] for x in team_size_votes]
+                team_counts = [x[1] for x in team_size_votes]
+                team_colors = [COLORS_BARS[i % len(COLORS_BARS)] for i in range(len(team_labels))]
+                try:
+                    _pie_chart_matplotlib(team_labels, team_counts, team_colors, "团队规模分布", pie_team_png, app_dir=_app_dir)
+                except Exception:
+                    pass
+            try:
+                idx = names.index(selected_name)
+                row_index = df_q.index[idx]
                 row_dims = df_dims.loc[row_index, dim_cols] if dim_cols else pd.Series(dtype=float)
-                person_dims = [float(row_dims[c]) for c in dim_cols] if len(dim_cols) == 5 else []
-                if len(person_dims) == 5:
-                    _radar_chart_matplotlib(dim_cols, person_dims, radar_io, avg_vals=avg_dims)
+                dim_means_all = df_dims[dim_cols].mean() if dim_cols else pd.Series(dtype=float)
+                theta_radar = dim_cols
+                r_person = [float(row_dims[c]) for c in theta_radar]
+                r_avg = [float(dim_means_all[c]) for c in theta_radar]
+                if len(r_person) == 5:
+                    _radar_chart_matplotlib(theta_radar, r_person, radar_png, avg_vals=r_avg, app_dir=_app_dir)
+                else:
+                    radar_png.seek(0)
             except Exception:
-                pass
+                radar_png = io.BytesIO()
+            person_scores = list(zip(names, [float(total.loc[df_q.index[i]]) for i in range(len(df_q))]))
+            person_scores.sort(key=lambda x: x[1], reverse=True)
+            top3_high = person_scores[:3]
+            top3_low = person_scores[-3:][::-1] if len(person_scores) >= 3 else person_scores[::-1]
+            score_cols = list(col_to_cat_be.keys())
+            anomaly_rows = []
+            name_col_anom = next((c for c in ["填写人", "姓名", "学员姓名"] if c in df.columns), None)
+            dept_col_anom = "部门" if "部门" in df.columns else None
+            for idx in df_q.index:
+                row = df_q.loc[idx, score_cols]
+                valid = row.dropna()
+                if len(valid) >= 1 and valid.nunique() == 1:
+                    uniform_score = float(valid.iloc[0])
+                    name = df.loc[idx, name_col_anom] if name_col_anom else str(idx)
+                    dept = df.loc[idx, dept_col_anom] if dept_col_anom else None
+                    note = f"该伙伴所有题目均为 {uniform_score:.1f} 分，建议管理者关注。"
+                    anomaly_rows.append((name, dept, uniform_score, note))
+            summary_votes = learning_module_votes
+            dim_means_all = df_dims[dim_cols].mean() if dim_cols else pd.Series(dtype=float)
+            avg_dims = [float(dim_means_all[c]) for c in dim_cols] if len(dim_cols) == 5 else None
+            person_details = []
+            for i in range(len(names)):
+                name = names[i]
+                row_index = df_q.index[i]
+                radar_io = io.BytesIO()
+                line_io = io.BytesIO()
+                try:
+                    row_dims = df_dims.loc[row_index, dim_cols] if dim_cols else pd.Series(dtype=float)
+                    person_dims = [float(row_dims[c]) for c in dim_cols] if len(dim_cols) == 5 else []
+                    if len(person_dims) == 5:
+                        _radar_chart_matplotlib(dim_cols, person_dims, radar_io, avg_vals=avg_dims, app_dir=_app_dir)
+                except Exception:
+                    pass
+                try:
+                    labels, values = get_person_behavior_scores(df_q, col_to_cat_be, row_index)
+                    if labels and values:
+                        _line_chart_behavior_matplotlib(labels, values, line_io, color_scheme=COLOR_SCHEME, app_dir=_app_dir)
+                except Exception:
+                    pass
+                person_details.append((name, radar_io, line_io))
             try:
-                labels, values = get_person_behavior_scores(df_q, col_to_cat_be, row_index)
-                if labels and values:
-                    _line_chart_behavior_matplotlib(labels, values, line_io, color_scheme=COLOR_SCHEME)
-            except Exception:
-                pass
-            person_details.append((name, radar_io, line_io))
-        try:
-            report = PDFReport(app_dir=_app_dir, report_type="team")
-            pdf_buf = report.build(
-                dim_means=dim_means,
-                summary_chart_png=summary_chart_png,
-                behavior_avgs=behavior_avgs,
-                behavior_chart_png=behavior_chart_png,
-                radar_images=[radar_png],
-                top3_high=top3_high,
-                top3_low=top3_low,
-                anomaly_rows=anomaly_rows,
-                names=names,
-                selected_name=selected_name,
-                summary_votes=summary_votes,
-                person_details=person_details,
-            )
-            st.session_state["pdf_report_bytes"] = pdf_buf.getvalue()
-            st.success("PDF 已生成，请点击下方下载。")
-        except Exception as e:
-            st.error("PDF 生成失败：" + str(e))
+                report = PDFReport(app_dir=_app_dir, report_type="team")
+                pdf_buf = report.build(
+                    dim_means=dim_means,
+                    summary_chart_png=summary_chart_png,
+                    pie_learning_png=pie_learning_png,
+                    pie_tenure_png=pie_tenure_png,
+                    pie_team_png=pie_team_png,
+                    behavior_avgs=behavior_avgs,
+                    behavior_chart_png=behavior_chart_png,
+                    radar_images=[radar_png],
+                    top3_high=top3_high,
+                    top3_low=top3_low,
+                    anomaly_rows=anomaly_rows,
+                    names=names,
+                    selected_name=selected_name,
+                    summary_votes=summary_votes,
+                    tenure_votes=tenure_votes,
+                    team_size_votes=team_size_votes,
+                    person_details=person_details,
+                )
+                st.session_state["pdf_report_bytes"] = pdf_buf.getvalue()
+                st.success("PDF 已生成，请点击下方下载。")
+            except Exception as e:
+                st.error("PDF 生成失败：" + str(e))
     if "pdf_report_bytes" in st.session_state:
         st.download_button(
             "下载 好未来新灵秀报告.pdf",
@@ -1211,10 +1468,109 @@ with tab1:
         unsafe_allow_html=True,
     )
 
+    # 希望深入学习的技能模块 + 管理年限 + 团队规模（三列并列）
+    st.markdown("---")
+    col_learning, col_tenure, col_team = st.columns(3)
+    _pie_height = 300
+
+    with col_learning:
+        st.markdown("#### 希望深入学习的技能模块")
+        st.caption("多选：「您希望在以下哪个技能模块进行深入的学习和研讨？」")
+        if not learning_module_votes:
+            st.info("未找到该多选题目或暂无有效选项。")
+        else:
+            mod_names = [x[0] for x in learning_module_votes]
+            mod_counts = [x[1] for x in learning_module_votes]
+            total_votes = sum(mod_counts)
+            pie_colors = [COLOR_SCHEME.get(m, "#3498db") for m in mod_names]
+            fig_learning = go.Figure(data=[go.Pie(
+                labels=mod_names,
+                values=mod_counts,
+                marker_colors=pie_colors,
+                textinfo="label+percent+value",
+                texttemplate="%{label}<br>%{percent}（%{value} 票）",
+                hole=0.4,
+            )])
+            fig_learning.update_layout(
+                height=_pie_height,
+                margin=dict(t=20, b=20, l=20, r=20),
+                showlegend=True,
+                legend=dict(orientation="h", yanchor="bottom", y=-0.14, xanchor="center", x=0.5, font=dict(size=9)),
+            )
+            fig_learning = apply_chart_style(fig_learning)
+            st.plotly_chart(fig_learning, use_container_width=True, config=PLOTLY_CONFIG)
+            if learning_module_votes:
+                top_mod, top_cnt = learning_module_votes[0]
+                st.caption(f"最受期待：**{top_mod}**（{top_cnt} 票，" + (f"{100*top_cnt/total_votes:.1f}%" if total_votes else "") + "）")
+
+    with col_tenure:
+        st.markdown("#### 管理年限分布")
+        st.caption("「您开始带团队有多久啦？」")
+        if not tenure_votes:
+            st.info("未找到该题目或暂无有效选项。")
+        else:
+            tenure_labels = [x[0] for x in tenure_votes]
+            tenure_counts = [x[1] for x in tenure_votes]
+            total_tenure = sum(tenure_counts)
+            n_tenure = len(tenure_labels)
+            tenure_colors = [COLORS_BARS[i % len(COLORS_BARS)] for i in range(n_tenure)]
+            fig_tenure = go.Figure(data=[go.Pie(
+                labels=tenure_labels,
+                values=tenure_counts,
+                marker_colors=tenure_colors,
+                textinfo="label+percent+value",
+                texttemplate="%{label}<br>%{percent}（%{value} 人）",
+                hole=0.4,
+            )])
+            fig_tenure.update_layout(
+                height=_pie_height,
+                margin=dict(t=20, b=20, l=20, r=20),
+                showlegend=True,
+                legend=dict(orientation="h", yanchor="bottom", y=-0.14, xanchor="center", x=0.5, font=dict(size=9)),
+            )
+            fig_tenure = apply_chart_style(fig_tenure)
+            st.plotly_chart(fig_tenure, use_container_width=True, config=PLOTLY_CONFIG)
+            if tenure_votes:
+                top_tenure, top_n = tenure_votes[0]
+                st.caption(f"人数最多：**{top_tenure}**（{top_n} 人，" + (f"{100*top_n/total_tenure:.1f}%" if total_tenure else "") + "）")
+
+    with col_team:
+        st.markdown("#### 团队规模分布")
+        st.caption("「向您直接汇报的伙伴有多少？」")
+        if not team_size_votes:
+            st.info("未找到该题目或暂无有效选项。")
+        else:
+            team_labels = [x[0] for x in team_size_votes]
+            team_counts = [x[1] for x in team_size_votes]
+            total_team = sum(team_counts)
+            n_team = len(team_labels)
+            team_colors = [COLORS_BARS[i % len(COLORS_BARS)] for i in range(n_team)]
+            fig_team = go.Figure(data=[go.Pie(
+                labels=team_labels,
+                values=team_counts,
+                marker_colors=team_colors,
+                textinfo="label+percent+value",
+                texttemplate="%{label}<br>%{percent}（%{value} 人）",
+                hole=0.4,
+            )])
+            fig_team.update_layout(
+                height=_pie_height,
+                margin=dict(t=20, b=20, l=20, r=20),
+                showlegend=True,
+                legend=dict(orientation="h", yanchor="bottom", y=-0.14, xanchor="center", x=0.5, font=dict(size=9)),
+            )
+            fig_team = apply_chart_style(fig_team)
+            st.plotly_chart(fig_team, use_container_width=True, config=PLOTLY_CONFIG)
+            if team_size_votes:
+                top_team, top_n = team_size_votes[0]
+                st.caption(f"人数最多：**{top_team}**（{top_n} 人，" + (f"{100*top_n/total_team:.1f}%" if total_team else "") + "）")
+
 # ---------- Tab 2: 维度深度分析（数据可视化 · 多维分析） ----------
 with tab2:
     st.markdown("#### 各维度行为项得分（全员平均）")
-    st.caption("针对同一主题的多个维度分析，便于发现各维度下的强弱行为项。左侧筛选器可切换学员，个人得分见「个人详细报告」。")
+    st.caption("针对同一主题的多个维度分析，便于发现各维度下的强弱行为项。")
+    # (模块, 行为项) -> 完整行为描述，用于柱状图 hover
+    _behavior_desc = {(m, b): d for m, b, d in SURVEY_QUESTIONS}
     behavior_avgs = get_behavior_avg_by_dimension(df_q, col_to_cat_be)
     dim_items = []
     for i, cat in enumerate(CATEGORY_ORDER):
@@ -1260,6 +1616,8 @@ with tab2:
                 fig_dim = go.Figure(data=[go.Bar(
                     x=be_names, y=be_scores, marker_color=bar_colors,
                     text=be_scores, texttemplate="%{text:.2f}", textposition="outside",
+                    hovertext=[f"{be}，{_behavior_desc.get((cat, be), '')}" for be in be_names],
+                    hoverinfo="text",
                 )])
                 fig_dim.update_layout(
                     xaxis_title="", yaxis_title="平均分",
@@ -1593,32 +1951,56 @@ with tab4:
             combined_text = " ".join(all_text_parts)
             _app_dir = os.path.dirname(os.path.abspath(__file__))
 
-            # 左右布局：左侧词云（略小），右侧填写明细，不再上下分屏
+            # 管理痛点与问题聚焦：按主题分组、去重后做结论式总结
+            pain_phrases = _extract_pain_point_phrases(combined_text, max_phrases=50)
+            pain_summaries = _summarise_pain_point_phrases(pain_phrases)
+            pain_keywords = _extract_pain_point_keywords(pain_phrases, top_n=20, min_word_len=1)
+
+            st.markdown("##### 管理痛点与问题聚焦")
+            st.caption("基于伙伴开放反馈中与管理痛点、问题、期待相关的表述进行归纳总结，便于针对性设计培训。")
+            if pain_summaries:
+                for theme, count, reprs in pain_summaries:
+                    st.markdown(f"**{theme}**（共 {count} 条相关反馈）")
+                    if reprs:
+                        repr_str = "；".join(f"「{r}」" for r in reprs if r)
+                        st.markdown(f"代表性表述：{repr_str}")
+                    st.markdown("")
+            else:
+                st.info("未从当前反馈中识别到与管理痛点/问题/期待相关的表述，可查看下方填写明细。")
+
+            st.markdown("---")
+            # 左右布局：左侧为「与管理问题相关」的词云 + 关键词，右侧填写明细
             col_wc, col_detail = st.columns([1, 2])
             with col_wc:
-                st.markdown("##### 伙伴反馈词云")
-                st.caption("根据开放反馈内容生成")
+                st.markdown("##### 管理问题相关词云")
+                st.caption("仅基于与管理问题、期待相关的反馈内容生成，便于了解群体普遍希望解决和改善的问题。")
+                text_for_wc = " ".join(pain_phrases) if pain_phrases else combined_text
                 wc_buf, top_keywords, wc_err = build_wordcloud_image(
-                    combined_text, width=420, height=320, mask_dir=_app_dir
+                    text_for_wc, width=420, height=320, mask_dir=_app_dir, min_word_length=1
                 )
-                if not wc_buf and len(combined_text.strip()) > 20:
+                if not wc_buf and len(text_for_wc.strip()) > 20:
                     wc_buf, top_keywords, wc_err = build_wordcloud_image(
-                        combined_text, width=420, height=320, mask_dir=_app_dir, use_mask=False
+                        text_for_wc, width=420, height=320, mask_dir=_app_dir, use_mask=False, min_word_length=1
                     )
                 if wc_buf:
                     st.image(wc_buf, use_container_width=True)
-                    if top_keywords:
-                        st.markdown(
-                            '<p style="font-size:13px; color:rgba(0,0,0,0.45); margin-top:8px;">'
-                            '<strong>高频词</strong>：' + "　".join(f'<span style="color:#1677ff;">{w}</span>' for w in top_keywords[:12]) +
-                            '</p>',
-                            unsafe_allow_html=True,
-                        )
                 else:
-                    st.caption("反馈内容过少，暂无法生成词云。")
+                    st.caption("反馈内容过少或暂无痛点相关表述，暂无法生成词云。")
                     if wc_err:
                         with st.expander("词云生成失败原因（可截图反馈）"):
                             st.code(wc_err, language=None)
+                if pain_keywords:
+                    st.markdown(
+                        '<p style="font-size:13px; color:rgba(0,0,0,0.65); margin-top:12px;">'
+                        '<strong>痛点相关关键词</strong>（来自上方归纳表述）</p>',
+                        unsafe_allow_html=True,
+                    )
+                    st.markdown(
+                        '<p style="font-size:13px; color:rgba(0,0,0,0.88); margin-top:4px;">'
+                        + "　".join(f'<span style="color:#c5221f;">{w}</span>（{c}）' for w, c in pain_keywords[:14]) +
+                        '</p>',
+                        unsafe_allow_html=True,
+                    )
 
             with col_detail:
                 st.markdown("##### 填写明细")

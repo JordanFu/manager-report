@@ -23,6 +23,8 @@ try:
     from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
     REPORTLAB_AVAILABLE = True
     REPORTLAB_IMPORT_ERROR = None
+    # 摘要页左右边距与 SimpleDocTemplate 一致，用于表格总宽=可用宽度，保证与段落左对齐
+    _FRAME_WIDTH_CM = 21 - 2 - 2  # A4 21cm，左右边距各 2cm
 except ImportError as e:
     REPORTLAB_AVAILABLE = False
     REPORTLAB_IMPORT_ERROR = str(e)
@@ -155,6 +157,9 @@ class PDFReport:
                 fontSize=14,
                 spaceBefore=14,
                 spaceAfter=8,
+                alignment=TA_LEFT,
+                leftIndent=0,
+                firstLineIndent=0,
             ),
             "heading2": ParagraphStyle(
                 name="H2",
@@ -163,6 +168,9 @@ class PDFReport:
                 fontSize=12,
                 spaceBefore=10,
                 spaceAfter=6,
+                alignment=TA_LEFT,
+                leftIndent=0,
+                firstLineIndent=0,
             ),
             "body": ParagraphStyle(
                 name="Body",
@@ -171,6 +179,9 @@ class PDFReport:
                 fontSize=10,
                 leading=14,
                 spaceAfter=6,
+                alignment=TA_LEFT,
+                leftIndent=0,
+                firstLineIndent=0,
             ),
             "subtitle": ParagraphStyle(
                 name="Subtitle",
@@ -297,6 +308,9 @@ class PDFReport:
         preface_text: str = None,
         dim_means: list = None,
         summary_chart_png: io.BytesIO = None,
+        pie_learning_png: io.BytesIO = None,
+        pie_tenure_png: io.BytesIO = None,
+        pie_team_png: io.BytesIO = None,
         behavior_avgs: dict = None,
         behavior_chart_png: io.BytesIO = None,
         radar_images: list = None,
@@ -306,6 +320,8 @@ class PDFReport:
         names: list = None,
         selected_name: str = None,
         summary_votes: list = None,
+        tenure_votes: list = None,
+        team_size_votes: list = None,
         person_details: list = None,
     ):
         """
@@ -316,6 +332,8 @@ class PDFReport:
         top3_high / top3_low: [(姓名, 总分), ...]
         anomaly_rows: [(姓名, 部门, 统一分值, 说明), ...]，部门可为 None
         summary_votes: [(模块名, 票数), ...] 希望重点学习的模块得票，按票数降序；无则传 None 或 []
+        tenure_votes: [(选项, 人数), ...] 管理年限分布，按人数降序；无则传 None 或 []
+        team_size_votes: [(选项, 人数), ...] 团队规模分布，按人数降序；无则传 None 或 []
         person_details: [(姓名, 雷达图BytesIO, 折线图BytesIO), ...] 学员自陈结果细则，每人一行
         """
         if not REPORTLAB_AVAILABLE:
@@ -453,8 +471,8 @@ class PDFReport:
             story.append(KeepTogether(second_page_block))
         story.append(PageBreak())
 
-        # 第一部分：报告摘要（简要文字 + 整体维度均分表 + 图表）
-        story.append(Paragraph("一、报告摘要", self.styles["heading1"]))
+        # 第三页：报告摘要（所有文字与表格左对齐，用单列全宽表格包裹）
+        summary_rows = [Paragraph("一、报告摘要", self.styles["heading1"])]
         if dim_means:
             scores = [s for _, s in dim_means]
             min_s, max_s = min(scores), max(scores)
@@ -466,24 +484,16 @@ class PDFReport:
                 p1 = "管理者们（指受测人员）在 5 个维度上的自评行为展现基本在&lt;%s&gt;和&lt;%s&gt;之间。" % (low_label if low_label != "—" else "很少如此", high_label if high_label != "—" else "总是如此")
             else:
                 p1 = "管理者们（指受测人员）在 5 个维度上的自评行为展现基本都在&lt;%s&gt;和&lt;%s&gt;之间。" % (low_label, high_label)
-            story.append(Paragraph(p1, self.styles["body"]))
+            summary_rows.append(Paragraph(p1, self.styles["body"]))
             dim_min_name = min(dim_means, key=lambda x: x[1])[0]
             dim_max_name = max(dim_means, key=lambda x: x[1])[0]
             p2 = (
                 "横向比较来看，管理者们自我评价在【%s】维度展现的行为稍显不足，在大家看来自己在这部分的管理动作展现不是特别的充分，"
                 "而在【%s】的运用上相对优于其他部分。"
             ) % (dim_min_name, dim_max_name)
-            story.append(Paragraph(p2, self.styles["body"]))
-            if summary_votes and len(summary_votes) > 0:
-                main_mod, main_cnt = summary_votes[0]
-                others = ["【%s】（%d 票）" % (m, c) for m, c in summary_votes[1:]]
-                p3 = "管理者们主要希望在【%s】（%d 票）进行深入的学习和研讨。" % (main_mod, main_cnt)
-                if others:
-                    p3 += "其他选项：" + " ".join(others) + "。"
-                story.append(Paragraph(p3, self.styles["body"]))
-            else:
-                story.append(Paragraph("（本期调研未采集「希望重点学习的模块」相关选项数据。）", self.styles["body"]))
-            story.append(Spacer(1, 0.4 * cm))
+            summary_rows.append(Paragraph(p2, self.styles["body"]))
+            summary_rows.append(Spacer(1, 0.4 * cm))
+        # 第一行左右结构：维度均分表 | 柱状图
         if dim_means:
             max_s = max(s for _, s in dim_means) if dim_means else 0
             min_s = min(s for _, s in dim_means) if dim_means else 0
@@ -491,23 +501,146 @@ class PDFReport:
             for dim, sc in dim_means:
                 note = "最高" if sc == max_s else ("最低" if sc == min_s else "")
                 data.append([dim, "%.2f" % sc, note])
-            t = Table(data, colWidths=[4 * cm, 3 * cm, 3 * cm])
-            t.setStyle(TableStyle([
+            bar_chart_height_cm = 4.8
+            n_rows = len(data)  # 1 表头 + 5 数据行
+            row_heights = [bar_chart_height_cm / n_rows * cm] * n_rows
+            col_width_left_cm = 6.2
+            dim_col_width = col_width_left_cm / 3
+            dim_table = Table(data, colWidths=[dim_col_width * cm, dim_col_width * cm, dim_col_width * cm], rowHeights=row_heights)
+            dim_table.setStyle(TableStyle([
                 ("FONTNAME", (0, 0), (-1, -1), self.font_name or "Helvetica"),
                 ("FONTSIZE", (0, 0), (-1, -1), 9),
                 ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f0f0f0")),
                 ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
             ]))
-            story.append(t)
-            story.append(Spacer(1, 0.5 * cm))
-        if summary_chart_png and summary_chart_png.getvalue():
+            bar_cell = Paragraph("（暂无图表）", self.styles["table_cell_center"])
+            if summary_chart_png and summary_chart_png.getvalue():
+                try:
+                    summary_chart_png.seek(0)
+                    bar_cell = Image(summary_chart_png, width=7.2 * cm, height=bar_chart_height_cm * cm)
+                except Exception:
+                    pass
+            row1 = Table(
+                [[dim_table, bar_cell]],
+                colWidths=[col_width_left_cm * cm, (_FRAME_WIDTH_CM - col_width_left_cm) * cm],
+            )
+            row1.setStyle(TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("ALIGN", (0, 0), (0, 0), "LEFT"),
+                ("ALIGN", (1, 0), (1, 0), "CENTER"),
+                ("LEFTPADDING", (0, 0), (0, -1), 0),
+                ("RIGHTPADDING", (0, 0), (0, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+                ("LEFTPADDING", (1, 0), (1, 0), 8),
+            ]))
+            summary_rows.append(row1)
+            summary_rows.append(Spacer(1, 0.4 * cm))
+        # 希望深入学习的技能模块：副标题与“管理者们……”放入同一左栏；右侧仅饼图
+        p3_para = Paragraph("（本期调研未采集「希望重点学习的模块」相关选项数据。）", self.styles["body"])
+        if summary_votes and len(summary_votes) > 0:
+            main_mod, main_cnt = summary_votes[0]
+            others = ["【%s】（%d 票）" % (m, c) for m, c in summary_votes[1:]]
+            p3_text = "管理者们主要希望在【%s】（%d 票）进行深入的学习和研讨。" % (main_mod, main_cnt)
+            if others:
+                p3_text += "其他选项：" + " ".join(others) + "。"
+            p3_para = Paragraph(p3_text, self.styles["body"])
+        left_block = Table([
+            [Paragraph("希望深入学习的技能模块", self.styles["heading2"])],
+            [p3_para],
+        ], colWidths=[8.2 * cm])
+        left_block.setStyle(TableStyle([
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ("TOPPADDING", (0, 0), (-1, -1), 0),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+            ("TOPPADDING", (0, 1), (0, 1), 4),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+        ]))
+        pie_learning_cell = Paragraph("（暂无数据）", self.styles["table_cell_center"])
+        if pie_learning_png and getattr(pie_learning_png, "getvalue", None) and pie_learning_png.getvalue():
             try:
-                summary_chart_png.seek(0)
-                img = Image(summary_chart_png, width=14 * cm, height=6 * cm)
-                story.append(img)
+                pie_learning_png.seek(0)
+                pie_learning_cell = Image(pie_learning_png, width=5.5 * cm, height=5.2 * cm)
             except Exception:
                 pass
+        row2 = Table(
+            [[left_block, pie_learning_cell]],
+            colWidths=[8.2 * cm, (_FRAME_WIDTH_CM - 8.2) * cm],
+        )
+        row2.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("ALIGN", (0, 0), (0, 0), "LEFT"),
+            ("ALIGN", (1, 0), (1, 0), "CENTER"),
+            ("LEFTPADDING", (0, 0), (0, -1), 0),
+            ("RIGHTPADDING", (0, 0), (0, -1), 0),
+            ("TOPPADDING", (0, 0), (-1, -1), 0),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+        ]))
+        summary_rows.append(row2)
+        summary_rows.append(Spacer(1, 0.4 * cm))
+        if tenure_votes and len(tenure_votes) > 0:
+            main_t, cnt_t = tenure_votes[0]
+            others_t = ["【%s】（%d 人）" % (o, c) for o, c in tenure_votes[1:3]]
+            p_tenure = "管理年限方面，多数伙伴为【%s】（%d 人）。" % (main_t, cnt_t)
+            if others_t:
+                p_tenure += "其次：" + "、".join(others_t) + "。"
+            summary_rows.append(Spacer(1, 0.4 * cm))
+            summary_rows.append(Paragraph(p_tenure, self.styles["body"]))
+        if team_size_votes and len(team_size_votes) > 0:
+            main_s, cnt_s = team_size_votes[0]
+            others_s = ["【%s】（%d 人）" % (o, c) for o, c in team_size_votes[1:3]]
+            p_team = "团队规模方面，多数伙伴为【%s】（%d 人）。" % (main_s, cnt_s)
+            if others_s:
+                p_team += "其次：" + "、".join(others_s) + "。"
+            summary_rows.append(Paragraph(p_team, self.styles["body"]))
+        pie_tenure_cell = None
+        pie_team_cell = None
+        if pie_tenure_png and getattr(pie_tenure_png, "getvalue", None) and pie_tenure_png.getvalue():
+            try:
+                pie_tenure_png.seek(0)
+                pie_tenure_cell = Image(pie_tenure_png, width=5.5 * cm, height=5.2 * cm)
+            except Exception:
+                pie_tenure_cell = Paragraph("管理年限分布（图略）", self.styles["table_cell_center"])
+        else:
+            pie_tenure_cell = Paragraph("管理年限分布（暂无数据）", self.styles["table_cell_center"])
+        if pie_team_png and getattr(pie_team_png, "getvalue", None) and pie_team_png.getvalue():
+            try:
+                pie_team_png.seek(0)
+                pie_team_cell = Image(pie_team_png, width=5.5 * cm, height=5.2 * cm)
+            except Exception:
+                pie_team_cell = Paragraph("团队规模分布（图略）", self.styles["table_cell_center"])
+        else:
+            pie_team_cell = Paragraph("团队规模分布（暂无数据）", self.styles["table_cell_center"])
+        summary_rows.append(Spacer(1, 0.4 * cm))
+        pie_two_table = Table(
+            [[pie_tenure_cell, pie_team_cell]],
+            colWidths=[(_FRAME_WIDTH_CM / 2) * cm, (_FRAME_WIDTH_CM / 2) * cm],
+        )
+        pie_two_table.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("LEFTPADDING", (0, 0), (0, -1), 0),
+            ("LEFTPADDING", (1, 0), (1, -1), 0),
+        ]))
+        summary_rows.append(pie_two_table)
+        summary_table = Table([[f] for f in summary_rows], colWidths=[_FRAME_WIDTH_CM * cm])
+        summary_table.setStyle(TableStyle([
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ("TOPPADDING", (0, 0), (-1, -1), 0),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+        ]))
+        story.append(summary_table)
         story.append(PageBreak())
 
         # 第三部分：各维度行为项平均分（第四页；三列表格 + 下方折线图）
