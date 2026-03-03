@@ -1577,18 +1577,20 @@ with tab1:
     # 希望深入学习的技能模块 + 管理年限 + 团队规模（三列并列）
     st.markdown("---")
     col_learning, col_tenure, col_team = st.columns(3)
-    # 图例放在下方，预留足够底部边距避免遮挡饼图；左右对称便于不同宽度自适应
-    _pie_height = 440
-    _pie_margin = dict(t=40, b=120, l=55, r=55)
+    # 饼图尽量占满可用区域，图例固定在区域最下方，减少留白
+    _pie_height = 420
+    _pie_margin = dict(t=20, b=72, l=36, r=36)
+    # 饼图占满绝大部分区域：横向 [0.02, 0.98]，纵向 [0.18, 0.92]，下方约 18% 专留给图例
+    _pie_domain = dict(x=[0.02, 0.98], y=[0.18, 0.92])
     _pie_legend = dict(
         orientation="h",
         yanchor="top",
-        y=0.08,
+        y=0.04,
         xanchor="center",
         x=0.5,
         font=dict(size=9),
         tracegroupgap=10,
-        itemwidth=24,
+        itemwidth=30,
     )
 
     with col_learning:
@@ -1609,6 +1611,7 @@ with tab1:
                 texttemplate="%{label}<br>%{percent}（%{value} 票）",
                 textposition="outside",
                 hole=0.4,
+                domain=_pie_domain,
             )])
             fig_learning.update_layout(
                 height=_pie_height,
@@ -1641,6 +1644,7 @@ with tab1:
                 texttemplate="%{label}<br>%{percent}（%{value} 人）",
                 textposition="outside",
                 hole=0.4,
+                domain=_pie_domain,
             )])
             fig_tenure.update_layout(
                 height=_pie_height,
@@ -1673,6 +1677,7 @@ with tab1:
                 texttemplate="%{label}<br>%{percent}（%{value} 人）",
                 textposition="outside",
                 hole=0.4,
+                domain=_pie_domain,
             )])
             fig_team.update_layout(
                 height=_pie_height,
