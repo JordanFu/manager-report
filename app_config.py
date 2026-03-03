@@ -88,3 +88,8 @@ LEARNING_MODULE_COL = "【多选】您希望在以下哪个技能模块进行深
 TENURE_COL = "您开始带团队有多久啦？"
 TEAM_SIZE_COL = "向您直接汇报的伙伴有多少？"
 EXCLUDE_PDF_ROLE_LABEL = "我走专业路线，没有带团队"
+# 导出 PDF 时排除的多种表述（原始数据中可能出现不同说法）
+EXCLUDE_PDF_ROLE_LABELS = [
+    "我走专业路线，没有带团队",
+    "我是走专业发展的，目前没带团队",
+]

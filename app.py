@@ -37,6 +37,7 @@ from app_config import (
     TENURE_COL,
     TEAM_SIZE_COL,
     EXCLUDE_PDF_ROLE_LABEL,
+    EXCLUDE_PDF_ROLE_LABELS,
     SURVEY_QUESTIONS,
 )
 from data_processor import (
@@ -1278,12 +1279,31 @@ with st.sidebar:
     elif st.button("📥 生成 PDF 报告", key="gen_pdf", use_container_width=True):
         with st.spinner("报告正在生成中，请稍候…"):
             _app_dir = os.path.dirname(os.path.abspath(__file__))
-            # 导出 PDF 时排除选择「我走专业路线，没有带团队」的伙伴（他们无带团队数据）
+            # 导出 PDF 时排除选择「我走专业路线，没有带团队」的伙伴（他们无带团队数据，不在 PDF 中展示任何详细信息，避免阅读困扰）
+            # 使用与页面一致的列：tenure_col / team_size_col（可能由「带团队」「汇报」等匹配），避免列名不完全一致时漏排除
             mask_exclude = pd.Series(False, index=df.index)
-            if TENURE_COL in df.columns:
-                mask_exclude |= df[TENURE_COL].astype(str).str.contains(EXCLUDE_PDF_ROLE_LABEL, na=False)
-            if TEAM_SIZE_COL in df.columns:
-                mask_exclude |= df[TEAM_SIZE_COL].astype(str).str.contains(EXCLUDE_PDF_ROLE_LABEL, na=False)
+            def _cell_contains_role_label(ser):
+                if ser is None or ser.empty:
+                    return pd.Series(False, index=df.index)
+                s = ser.fillna("").astype(str).str.strip()
+                # 任一排除表述的精确匹配
+                exact = pd.Series(False, index=df.index)
+                for label in EXCLUDE_PDF_ROLE_LABELS:
+                    exact = exact | s.str.contains(label, na=False, regex=False)
+                # 或关键词组合：原版「我走专业路线」+「没有带团队」、新版「专业发展」+「没带团队」
+                kw1 = s.str.contains("我走专业路线", na=False, regex=False) & s.str.contains("没有带团队", na=False, regex=False)
+                kw2 = s.str.contains("专业发展", na=False, regex=False) & s.str.contains("没带团队", na=False, regex=False)
+                return exact | kw1 | kw2
+            _col_tenure = tenure_col if tenure_col is not None else (TENURE_COL if TENURE_COL in df.columns else None)
+            _col_team = team_size_col if team_size_col is not None else (TEAM_SIZE_COL if TEAM_SIZE_COL in df.columns else None)
+            if _col_tenure is None:
+                _col_tenure = next((c for c in df.columns if "带团队" in str(c) and "多久" in str(c)), None)
+            if _col_team is None:
+                _col_team = next((c for c in df.columns if "汇报" in str(c) and "伙伴" in str(c)), None)
+            if _col_tenure is not None:
+                mask_exclude |= _cell_contains_role_label(df[_col_tenure])
+            if _col_team is not None:
+                mask_exclude |= _cell_contains_role_label(df[_col_team])
             keep_idx = df.index[~mask_exclude]
             if len(keep_idx) == 0:
                 st.error("当前数据中所有伙伴均选择「我走专业路线，没有带团队」，无法生成 PDF。")
@@ -1309,15 +1329,15 @@ with st.sidebar:
                                 _counts[token] += 1
                     learning_module_votes_pdf = sorted(_counts.items(), key=lambda x: -x[1])
                 tenure_votes_pdf = []
-                if TENURE_COL in df_pdf.columns:
-                    s = df_pdf[TENURE_COL].fillna("未填写").astype(str).str.strip()
+                if _col_tenure is not None and _col_tenure in df_pdf.columns:
+                    s = df_pdf[_col_tenure].fillna("未填写").astype(str).str.strip()
                     s = s.replace("", "未填写").replace("nan", "未填写")
                     vc = s.value_counts()
                     tenure_votes_pdf = [(str(k), int(v)) for k, v in vc.items() if str(k).strip()]
                     tenure_votes_pdf.sort(key=lambda x: -x[1])
                 team_size_votes_pdf = []
-                if TEAM_SIZE_COL in df_pdf.columns:
-                    s = df_pdf[TEAM_SIZE_COL].fillna("未填写").astype(str).str.strip()
+                if _col_team is not None and _col_team in df_pdf.columns:
+                    s = df_pdf[_col_team].fillna("未填写").astype(str).str.strip()
                     s = s.replace("", "未填写").replace("nan", "未填写")
                     vc = s.value_counts()
                     team_size_votes_pdf = [(str(k), int(v)) for k, v in vc.items() if str(k).strip()]
@@ -1441,6 +1461,13 @@ with st.sidebar:
                 for i in range(len(names_pdf)):
                     name = names_pdf[i]
                     row_index = df_q_pdf.index[i]
+                    # 再次确认该行未选择「专业路线」，防止漏排除（不加入附录详情）
+                    if _col_tenure is not None and _col_tenure in df.columns:
+                        if _cell_contains_role_label(df.loc[[row_index], _col_tenure]).any():
+                            continue
+                    if _col_team is not None and _col_team in df.columns:
+                        if _cell_contains_role_label(df.loc[[row_index], _col_team]).any():
+                            continue
                     radar_io = io.BytesIO()
                     line_io = io.BytesIO()
                     try:
