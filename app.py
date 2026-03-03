@@ -36,6 +36,7 @@ from config import (
     LEARNING_MODULE_COL,
     TENURE_COL,
     TEAM_SIZE_COL,
+    EXCLUDE_PDF_ROLE_LABEL,
     SURVEY_QUESTIONS,
 )
 from data_processor import (
@@ -974,7 +975,7 @@ def _radar_chart_matplotlib(dim_labels, person_vals, out_buffer, avg_vals=None, 
 
 
 def _line_chart_behavior_matplotlib(labels, values, out_buffer, color_scheme=None, app_dir=None):
-    """用 matplotlib 绘制模块+行为项得分折线图。x=模块-行为项，y=得分；按模块着色，y 轴随数据范围以突出趋势。"""
+    """用 matplotlib 绘制模块+行为项得分折线图。x=模块-行为项，y=得分；按模块着色。PDF 导出时纵轴统一为 1～5、步长 1。"""
     _set_matplotlib_chinese_font(app_dir)
     plt.rcParams["font.sans-serif"] = plt.rcParams.get("font.sans-serif", ["SimHei", "PingFang SC", "Microsoft YaHei", "DejaVu Sans", "sans-serif"])
     plt.rcParams["axes.unicode_minus"] = False
@@ -994,12 +995,8 @@ def _line_chart_behavior_matplotlib(labels, values, out_buffer, color_scheme=Non
     ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
     ax.set_ylabel("得分")
     ax.set_xlabel("模块-行为项")
-    y_min, y_max = min(vals), max(vals)
-    margin = 0.45
-    if y_max - y_min < 0.3:
-        ax.set_ylim(max(0.5, y_min - 0.5), min(5.5, y_max + 0.5))
-    else:
-        ax.set_ylim(max(0.5, y_min - margin), min(5.5, y_max + margin))
+    ax.set_ylim(1, 5)
+    ax.set_yticks([1, 2, 3, 4, 5])
     ax.grid(True, linestyle="--", alpha=0.6)
     seen = []
     for m in modules:
@@ -1281,165 +1278,210 @@ with st.sidebar:
     elif st.button("📥 生成 PDF 报告", key="gen_pdf", use_container_width=True):
         with st.spinner("报告正在生成中，请稍候…"):
             _app_dir = os.path.dirname(os.path.abspath(__file__))
-            dim_cols = [c for c in CATEGORY_ORDER if c in df_dims.columns]
-            dim_means = [(c, float(df_dims[c].mean())) for c in dim_cols]
-            behavior_avgs = get_behavior_avg_by_dimension(df_q, col_to_cat_be)
-            summary_chart_png = io.BytesIO()
-            radar_png = io.BytesIO()
-            summary = pd.DataFrame({"维度": [x[0] for x in dim_means], "全员平均分": [x[1] for x in dim_means]})
-            dims = summary["维度"].tolist()
-            scores = summary["全员平均分"].values
-            bar_colors = [COLOR_SCHEME.get(d, "#3498db") for d in dims]
-            # PDF 导出优先用 matplotlib 生成图表，确保云端/多设备下中文字体正确显示，避免 kaleido 无中文字体乱码
-            try:
-                _summary_chart_matplotlib(dims, scores, bar_colors, summary_chart_png, app_dir=_app_dir)
-            except Exception:
-                try:
-                    fig_summary = go.Figure(data=[go.Bar(
-                        x=dims,
-                        y=summary["全员平均分"],
-                        marker_color=bar_colors,
-                        text=summary["全员平均分"].round(2),
-                        texttemplate="%{text:.2f}",
-                        textposition="outside",
-                        textfont=dict(size=12),
-                    )])
-                    fig_summary.update_layout(
-                        xaxis_title="维度",
-                        yaxis_title="得分",
-                        yaxis=dict(range=[0, 5.5], dtick=1, showgrid=True, gridcolor="#e8e8e8"),
-                        height=340,
-                        margin=dict(b=100, t=50, l=60, r=40),
-                        showlegend=False,
-                    )
-                    fig_summary.update_xaxes(tickangle=-25, tickfont=dict(size=11))
-                    fig_summary = apply_chart_style(fig_summary)
-                    img_bytes = fig_summary.to_image(format="png", engine="kaleido")
-                    summary_chart_png.write(img_bytes)
-                except Exception:
-                    pass
-            summary_chart_png.seek(0)
-            if len(summary_chart_png.getvalue()) == 0:
+            # 导出 PDF 时排除选择「我走专业路线，没有带团队」的伙伴（他们无带团队数据）
+            mask_exclude = pd.Series(False, index=df.index)
+            if TENURE_COL in df.columns:
+                mask_exclude |= df[TENURE_COL].astype(str).str.contains(EXCLUDE_PDF_ROLE_LABEL, na=False)
+            if TEAM_SIZE_COL in df.columns:
+                mask_exclude |= df[TEAM_SIZE_COL].astype(str).str.contains(EXCLUDE_PDF_ROLE_LABEL, na=False)
+            keep_idx = df.index[~mask_exclude]
+            if len(keep_idx) == 0:
+                st.error("当前数据中所有伙伴均选择「我走专业路线，没有带团队」，无法生成 PDF。")
+            else:
+                df_q_pdf = df_q.loc[keep_idx]
+                df_dims_pdf = df_dims.loc[keep_idx]
+                _name_col = next((c for c in ["填写人", "姓名", "学员姓名"] if c in df.columns), None)
+                names_pdf = df.loc[keep_idx, _name_col].astype(str).tolist()
+                total_pdf = total.loc[keep_idx]
+                selected_name_pdf = selected_name if selected_name in names_pdf else (names_pdf[0] if names_pdf else None)
+                # 从过滤后的数据重新统计技能模块 / 管理年限 / 团队规模（PDF 中不再含「专业路线」选项）
+                df_pdf = df.loc[keep_idx]
+                learning_module_votes_pdf = []
+                if LEARNING_MODULE_COL in df_pdf.columns:
+                    _counts = Counter()
+                    for val in df_pdf[LEARNING_MODULE_COL].dropna().astype(str):
+                        _v = val
+                        for sep in ["，", "、", "；", ";", ",", "\n"]:
+                            _v = _v.replace(sep, "\t")
+                        for part in _v.split("\t"):
+                            token = part.strip()
+                            if token in CATEGORY_ORDER:
+                                _counts[token] += 1
+                    learning_module_votes_pdf = sorted(_counts.items(), key=lambda x: -x[1])
+                tenure_votes_pdf = []
+                if TENURE_COL in df_pdf.columns:
+                    s = df_pdf[TENURE_COL].fillna("未填写").astype(str).str.strip()
+                    s = s.replace("", "未填写").replace("nan", "未填写")
+                    vc = s.value_counts()
+                    tenure_votes_pdf = [(str(k), int(v)) for k, v in vc.items() if str(k).strip()]
+                    tenure_votes_pdf.sort(key=lambda x: -x[1])
+                team_size_votes_pdf = []
+                if TEAM_SIZE_COL in df_pdf.columns:
+                    s = df_pdf[TEAM_SIZE_COL].fillna("未填写").astype(str).str.strip()
+                    s = s.replace("", "未填写").replace("nan", "未填写")
+                    vc = s.value_counts()
+                    team_size_votes_pdf = [(str(k), int(v)) for k, v in vc.items() if str(k).strip()]
+                    team_size_votes_pdf.sort(key=lambda x: -x[1])
+
+                dim_cols = [c for c in CATEGORY_ORDER if c in df_dims_pdf.columns]
+                dim_means = [(c, float(df_dims_pdf[c].mean())) for c in dim_cols]
+                behavior_avgs = get_behavior_avg_by_dimension(df_q_pdf, col_to_cat_be)
+                summary_chart_png = io.BytesIO()
+                radar_png = io.BytesIO()
+                summary = pd.DataFrame({"维度": [x[0] for x in dim_means], "全员平均分": [x[1] for x in dim_means]})
+                dims = summary["维度"].tolist()
+                scores = summary["全员平均分"].values
+                bar_colors = [COLOR_SCHEME.get(d, "#3498db") for d in dims]
+                # PDF 导出优先用 matplotlib 生成图表，确保云端/多设备下中文字体正确显示，避免 kaleido 无中文字体乱码
                 try:
                     _summary_chart_matplotlib(dims, scores, bar_colors, summary_chart_png, app_dir=_app_dir)
                 except Exception:
-                    pass
-            summary_chart_png.seek(0)
-            behavior_chart_png = io.BytesIO()
-            try:
-                labels_avg, values_avg = get_all_behavior_avgs(df_q, col_to_cat_be)
-                if labels_avg and values_avg:
-                    _line_chart_behavior_matplotlib(labels_avg, values_avg, behavior_chart_png, color_scheme=COLOR_SCHEME, app_dir=_app_dir)
-            except Exception:
-                pass
-            behavior_chart_png.seek(0)
-            # 三个饼图（希望深入学习的技能模块、管理年限、团队规模），放在报告摘要柱状图下方
-            pie_learning_png = io.BytesIO()
-            pie_tenure_png = io.BytesIO()
-            pie_team_png = io.BytesIO()
-            if learning_module_votes:
-                mod_names = [x[0] for x in learning_module_votes]
-                mod_counts = [x[1] for x in learning_module_votes]
-                pie_colors = [COLOR_SCHEME.get(m, "#3498db") for m in mod_names]
+                    try:
+                        fig_summary = go.Figure(data=[go.Bar(
+                            x=dims,
+                            y=summary["全员平均分"],
+                            marker_color=bar_colors,
+                            text=summary["全员平均分"].round(2),
+                            texttemplate="%{text:.2f}",
+                            textposition="outside",
+                            textfont=dict(size=12),
+                        )])
+                        fig_summary.update_layout(
+                            xaxis_title="维度",
+                            yaxis_title="得分",
+                            yaxis=dict(range=[0, 5.5], dtick=1, showgrid=True, gridcolor="#e8e8e8"),
+                            height=340,
+                            margin=dict(b=100, t=50, l=60, r=40),
+                            showlegend=False,
+                        )
+                        fig_summary.update_xaxes(tickangle=-25, tickfont=dict(size=11))
+                        fig_summary = apply_chart_style(fig_summary)
+                        img_bytes = fig_summary.to_image(format="png", engine="kaleido")
+                        summary_chart_png.write(img_bytes)
+                    except Exception:
+                        pass
+                summary_chart_png.seek(0)
+                if len(summary_chart_png.getvalue()) == 0:
+                    try:
+                        _summary_chart_matplotlib(dims, scores, bar_colors, summary_chart_png, app_dir=_app_dir)
+                    except Exception:
+                        pass
+                summary_chart_png.seek(0)
+                behavior_chart_png = io.BytesIO()
                 try:
-                    _pie_chart_matplotlib(mod_names, mod_counts, pie_colors, "", pie_learning_png, app_dir=_app_dir)
+                    labels_avg, values_avg = get_all_behavior_avgs(df_q_pdf, col_to_cat_be)
+                    if labels_avg and values_avg:
+                        _line_chart_behavior_matplotlib(labels_avg, values_avg, behavior_chart_png, color_scheme=COLOR_SCHEME, app_dir=_app_dir)
                 except Exception:
                     pass
-            if tenure_votes:
-                tenure_labels = [x[0] for x in tenure_votes]
-                tenure_counts = [x[1] for x in tenure_votes]
-                tenure_colors = [COLORS_BARS[i % len(COLORS_BARS)] for i in range(len(tenure_labels))]
+                behavior_chart_png.seek(0)
+                # 三个饼图（希望深入学习的技能模块、管理年限、团队规模），放在报告摘要柱状图下方
+                pie_learning_png = io.BytesIO()
+                pie_tenure_png = io.BytesIO()
+                pie_team_png = io.BytesIO()
+                if learning_module_votes_pdf:
+                    mod_names = [x[0] for x in learning_module_votes_pdf]
+                    mod_counts = [x[1] for x in learning_module_votes_pdf]
+                    pie_colors = [COLOR_SCHEME.get(m, "#3498db") for m in mod_names]
+                    try:
+                        _pie_chart_matplotlib(mod_names, mod_counts, pie_colors, "", pie_learning_png, app_dir=_app_dir)
+                    except Exception:
+                        pass
+                if tenure_votes_pdf:
+                    tenure_labels = [x[0] for x in tenure_votes_pdf]
+                    tenure_counts = [x[1] for x in tenure_votes_pdf]
+                    tenure_colors = [COLORS_BARS[i % len(COLORS_BARS)] for i in range(len(tenure_labels))]
+                    try:
+                        _pie_chart_matplotlib(tenure_labels, tenure_counts, tenure_colors, "管理年限分布", pie_tenure_png, app_dir=_app_dir)
+                    except Exception:
+                        pass
+                if team_size_votes_pdf:
+                    team_labels = [x[0] for x in team_size_votes_pdf]
+                    team_counts = [x[1] for x in team_size_votes_pdf]
+                    team_colors = [COLORS_BARS[i % len(COLORS_BARS)] for i in range(len(team_labels))]
+                    try:
+                        _pie_chart_matplotlib(team_labels, team_counts, team_colors, "团队规模分布", pie_team_png, app_dir=_app_dir)
+                    except Exception:
+                        pass
                 try:
-                    _pie_chart_matplotlib(tenure_labels, tenure_counts, tenure_colors, "管理年限分布", pie_tenure_png, app_dir=_app_dir)
+                    idx = names_pdf.index(selected_name_pdf)
+                    row_index = df_q_pdf.index[idx]
+                    row_dims = df_dims_pdf.loc[row_index, dim_cols] if dim_cols else pd.Series(dtype=float)
+                    dim_means_all = df_dims_pdf[dim_cols].mean() if dim_cols else pd.Series(dtype=float)
+                    theta_radar = dim_cols
+                    r_person = [float(row_dims[c]) for c in theta_radar]
+                    r_avg = [float(dim_means_all[c]) for c in theta_radar]
+                    if len(r_person) == 5:
+                        _radar_chart_matplotlib(theta_radar, r_person, radar_png, avg_vals=r_avg, app_dir=_app_dir)
+                    else:
+                        radar_png.seek(0)
                 except Exception:
-                    pass
-            if team_size_votes:
-                team_labels = [x[0] for x in team_size_votes]
-                team_counts = [x[1] for x in team_size_votes]
-                team_colors = [COLORS_BARS[i % len(COLORS_BARS)] for i in range(len(team_labels))]
+                    radar_png = io.BytesIO()
+                person_scores = list(zip(names_pdf, [float(total_pdf.loc[df_q_pdf.index[i]]) for i in range(len(df_q_pdf))]))
+                person_scores.sort(key=lambda x: x[1], reverse=True)
+                top3_high = person_scores[:3]
+                top3_low = person_scores[-3:][::-1] if len(person_scores) >= 3 else person_scores[::-1]
+                score_cols = list(col_to_cat_be.keys())
+                anomaly_rows = []
+                name_col_anom = next((c for c in ["填写人", "姓名", "学员姓名"] if c in df.columns), None)
+                dept_col_anom = "部门" if "部门" in df.columns else None
+                for idx in df_q_pdf.index:
+                    row = df_q_pdf.loc[idx, score_cols]
+                    valid = row.dropna()
+                    if len(valid) >= 1 and valid.nunique() == 1:
+                        uniform_score = float(valid.iloc[0])
+                        name = df.loc[idx, name_col_anom] if name_col_anom else str(idx)
+                        dept = df.loc[idx, dept_col_anom] if dept_col_anom else None
+                        note = f"该伙伴所有题目均为 {uniform_score:.1f} 分，建议管理者关注。"
+                        anomaly_rows.append((name, dept, uniform_score, note))
+                summary_votes = learning_module_votes_pdf
+                dim_means_all = df_dims_pdf[dim_cols].mean() if dim_cols else pd.Series(dtype=float)
+                avg_dims = [float(dim_means_all[c]) for c in dim_cols] if len(dim_cols) == 5 else None
+                person_details = []
+                for i in range(len(names_pdf)):
+                    name = names_pdf[i]
+                    row_index = df_q_pdf.index[i]
+                    radar_io = io.BytesIO()
+                    line_io = io.BytesIO()
+                    try:
+                        row_dims = df_dims_pdf.loc[row_index, dim_cols] if dim_cols else pd.Series(dtype=float)
+                        person_dims = [float(row_dims[c]) for c in dim_cols] if len(dim_cols) == 5 else []
+                        if len(person_dims) == 5:
+                            _radar_chart_matplotlib(dim_cols, person_dims, radar_io, avg_vals=avg_dims, app_dir=_app_dir)
+                    except Exception:
+                        pass
+                    try:
+                        labels, values = get_person_behavior_scores(df_q_pdf, col_to_cat_be, row_index)
+                        if labels and values:
+                            _line_chart_behavior_matplotlib(labels, values, line_io, color_scheme=COLOR_SCHEME, app_dir=_app_dir)
+                    except Exception:
+                        pass
+                    person_details.append((name, radar_io, line_io))
                 try:
-                    _pie_chart_matplotlib(team_labels, team_counts, team_colors, "团队规模分布", pie_team_png, app_dir=_app_dir)
-                except Exception:
-                    pass
-            try:
-                idx = names.index(selected_name)
-                row_index = df_q.index[idx]
-                row_dims = df_dims.loc[row_index, dim_cols] if dim_cols else pd.Series(dtype=float)
-                dim_means_all = df_dims[dim_cols].mean() if dim_cols else pd.Series(dtype=float)
-                theta_radar = dim_cols
-                r_person = [float(row_dims[c]) for c in theta_radar]
-                r_avg = [float(dim_means_all[c]) for c in theta_radar]
-                if len(r_person) == 5:
-                    _radar_chart_matplotlib(theta_radar, r_person, radar_png, avg_vals=r_avg, app_dir=_app_dir)
-                else:
-                    radar_png.seek(0)
-            except Exception:
-                radar_png = io.BytesIO()
-            person_scores = list(zip(names, [float(total.loc[df_q.index[i]]) for i in range(len(df_q))]))
-            person_scores.sort(key=lambda x: x[1], reverse=True)
-            top3_high = person_scores[:3]
-            top3_low = person_scores[-3:][::-1] if len(person_scores) >= 3 else person_scores[::-1]
-            score_cols = list(col_to_cat_be.keys())
-            anomaly_rows = []
-            name_col_anom = next((c for c in ["填写人", "姓名", "学员姓名"] if c in df.columns), None)
-            dept_col_anom = "部门" if "部门" in df.columns else None
-            for idx in df_q.index:
-                row = df_q.loc[idx, score_cols]
-                valid = row.dropna()
-                if len(valid) >= 1 and valid.nunique() == 1:
-                    uniform_score = float(valid.iloc[0])
-                    name = df.loc[idx, name_col_anom] if name_col_anom else str(idx)
-                    dept = df.loc[idx, dept_col_anom] if dept_col_anom else None
-                    note = f"该伙伴所有题目均为 {uniform_score:.1f} 分，建议管理者关注。"
-                    anomaly_rows.append((name, dept, uniform_score, note))
-            summary_votes = learning_module_votes
-            dim_means_all = df_dims[dim_cols].mean() if dim_cols else pd.Series(dtype=float)
-            avg_dims = [float(dim_means_all[c]) for c in dim_cols] if len(dim_cols) == 5 else None
-            person_details = []
-            for i in range(len(names)):
-                name = names[i]
-                row_index = df_q.index[i]
-                radar_io = io.BytesIO()
-                line_io = io.BytesIO()
-                try:
-                    row_dims = df_dims.loc[row_index, dim_cols] if dim_cols else pd.Series(dtype=float)
-                    person_dims = [float(row_dims[c]) for c in dim_cols] if len(dim_cols) == 5 else []
-                    if len(person_dims) == 5:
-                        _radar_chart_matplotlib(dim_cols, person_dims, radar_io, avg_vals=avg_dims, app_dir=_app_dir)
-                except Exception:
-                    pass
-                try:
-                    labels, values = get_person_behavior_scores(df_q, col_to_cat_be, row_index)
-                    if labels and values:
-                        _line_chart_behavior_matplotlib(labels, values, line_io, color_scheme=COLOR_SCHEME, app_dir=_app_dir)
-                except Exception:
-                    pass
-                person_details.append((name, radar_io, line_io))
-            try:
-                report = PDFReport(app_dir=_app_dir, report_type="team")
-                pdf_buf = report.build(
-                    dim_means=dim_means,
-                    summary_chart_png=summary_chart_png,
-                    pie_learning_png=pie_learning_png,
-                    pie_tenure_png=pie_tenure_png,
-                    pie_team_png=pie_team_png,
-                    behavior_avgs=behavior_avgs,
-                    behavior_chart_png=behavior_chart_png,
-                    radar_images=[radar_png],
-                    top3_high=top3_high,
-                    top3_low=top3_low,
-                    anomaly_rows=anomaly_rows,
-                    names=names,
-                    selected_name=selected_name,
-                    summary_votes=summary_votes,
-                    tenure_votes=tenure_votes,
-                    team_size_votes=team_size_votes,
-                    person_details=person_details,
-                )
-                st.session_state["pdf_report_bytes"] = pdf_buf.getvalue()
-                st.success("PDF 已生成，请点击下方下载。")
-            except Exception as e:
-                st.error("PDF 生成失败：" + str(e))
+                    report = PDFReport(app_dir=_app_dir, report_type="team")
+                    pdf_buf = report.build(
+                        dim_means=dim_means,
+                        summary_chart_png=summary_chart_png,
+                        pie_learning_png=pie_learning_png,
+                        pie_tenure_png=pie_tenure_png,
+                        pie_team_png=pie_team_png,
+                        behavior_avgs=behavior_avgs,
+                        behavior_chart_png=behavior_chart_png,
+                        radar_images=[radar_png],
+                        top3_high=top3_high,
+                        top3_low=top3_low,
+                        anomaly_rows=anomaly_rows,
+                        names=names_pdf,
+                        selected_name=selected_name_pdf,
+                        summary_votes=summary_votes,
+                        tenure_votes=tenure_votes_pdf,
+                        team_size_votes=team_size_votes_pdf,
+                        person_details=person_details,
+                    )
+                    st.session_state["pdf_report_bytes"] = pdf_buf.getvalue()
+                    st.success("PDF 已生成，请点击下方下载。")
+                except Exception as e:
+                    st.error("PDF 生成失败：" + str(e))
     if "pdf_report_bytes" in st.session_state:
         st.download_button(
             "下载 好未来新灵秀报告.pdf",
@@ -1535,7 +1577,19 @@ with tab1:
     # 希望深入学习的技能模块 + 管理年限 + 团队规模（三列并列）
     st.markdown("---")
     col_learning, col_tenure, col_team = st.columns(3)
-    _pie_height = 300
+    # 图例放在下方，预留足够底部边距避免遮挡饼图；左右对称便于不同宽度自适应
+    _pie_height = 440
+    _pie_margin = dict(t=40, b=120, l=55, r=55)
+    _pie_legend = dict(
+        orientation="h",
+        yanchor="top",
+        y=0.08,
+        xanchor="center",
+        x=0.5,
+        font=dict(size=9),
+        tracegroupgap=10,
+        itemwidth=24,
+    )
 
     with col_learning:
         st.markdown("#### 希望深入学习的技能模块")
@@ -1553,13 +1607,14 @@ with tab1:
                 marker_colors=pie_colors,
                 textinfo="label+percent+value",
                 texttemplate="%{label}<br>%{percent}（%{value} 票）",
+                textposition="outside",
                 hole=0.4,
             )])
             fig_learning.update_layout(
                 height=_pie_height,
-                margin=dict(t=20, b=20, l=20, r=20),
+                margin=_pie_margin,
                 showlegend=True,
-                legend=dict(orientation="h", yanchor="bottom", y=-0.14, xanchor="center", x=0.5, font=dict(size=9)),
+                legend=_pie_legend,
             )
             fig_learning = apply_chart_style(fig_learning)
             st.plotly_chart(fig_learning, use_container_width=True, config=PLOTLY_CONFIG)
@@ -1584,13 +1639,14 @@ with tab1:
                 marker_colors=tenure_colors,
                 textinfo="label+percent+value",
                 texttemplate="%{label}<br>%{percent}（%{value} 人）",
+                textposition="outside",
                 hole=0.4,
             )])
             fig_tenure.update_layout(
                 height=_pie_height,
-                margin=dict(t=20, b=20, l=20, r=20),
+                margin=_pie_margin,
                 showlegend=True,
-                legend=dict(orientation="h", yanchor="bottom", y=-0.14, xanchor="center", x=0.5, font=dict(size=9)),
+                legend=_pie_legend,
             )
             fig_tenure = apply_chart_style(fig_tenure)
             st.plotly_chart(fig_tenure, use_container_width=True, config=PLOTLY_CONFIG)
@@ -1615,13 +1671,14 @@ with tab1:
                 marker_colors=team_colors,
                 textinfo="label+percent+value",
                 texttemplate="%{label}<br>%{percent}（%{value} 人）",
+                textposition="outside",
                 hole=0.4,
             )])
             fig_team.update_layout(
                 height=_pie_height,
-                margin=dict(t=20, b=20, l=20, r=20),
+                margin=_pie_margin,
                 showlegend=True,
-                legend=dict(orientation="h", yanchor="bottom", y=-0.14, xanchor="center", x=0.5, font=dict(size=9)),
+                legend=_pie_legend,
             )
             fig_team = apply_chart_style(fig_team)
             st.plotly_chart(fig_team, use_container_width=True, config=PLOTLY_CONFIG)
@@ -1931,24 +1988,6 @@ with tab3:
             })
         if rows:
             dim_tables.append((dim, pd.DataFrame(rows)))
-
-    # 管理角色认知按 6 行展示，与右侧辅导等维度高度一致（不足补空行，超过截断）
-    TARGET_ROWS = 6
-    DIM_FIX_ROWS = "管理角色认知"
-    fixed = []
-    for dim, dim_df in dim_tables:
-        if dim == DIM_FIX_ROWS:
-            n = len(dim_df)
-            if n >= TARGET_ROWS:
-                dim_df = dim_df.head(TARGET_ROWS).copy()
-            else:
-                empty = pd.DataFrame([
-                    {"行为项": "", "行为描述": "", "得分": "", "均分": ""}
-                    for _ in range(TARGET_ROWS - n)
-                ])
-                dim_df = pd.concat([dim_df, empty], ignore_index=True)
-        fixed.append((dim, dim_df))
-    dim_tables = fixed
 
     col1, col2 = st.columns(2)
     for i, (dim, dim_df) in enumerate(dim_tables):
