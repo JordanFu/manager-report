@@ -3,7 +3,7 @@
 
 import pandas as pd
 import numpy as np
-from config import SCORE_MAP, QUESTION_MAPPING, CATEGORY_ORDER
+from app_config import SCORE_MAP, QUESTION_MAPPING, CATEGORY_ORDER
 
 
 def find_question_columns(df: pd.DataFrame):

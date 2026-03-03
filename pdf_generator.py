@@ -30,7 +30,7 @@ except ImportError as e:
     REPORTLAB_IMPORT_ERROR = str(e)
 
 try:
-    from config import COLOR_SCHEME, SURVEY_QUESTIONS, SCORE_MAP
+    from app_config import COLOR_SCHEME, SURVEY_QUESTIONS, SCORE_MAP
 except ImportError:
     COLOR_SCHEME = {}
     SURVEY_QUESTIONS = []

@@ -5,7 +5,7 @@ import os
 import json
 import pandas as pd
 import plotly.graph_objects as go
-from config import CATEGORY_ORDER, COLORS_BARS
+from app_config import CATEGORY_ORDER, COLORS_BARS
 from data_processor import (
     clean_and_score,
     compute_dimension_scores,
