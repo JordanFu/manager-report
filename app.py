@@ -897,6 +897,16 @@ PLOTLY_CONFIG = {
     "displaylogo": False,
 }
 
+
+class PDFPersonDetail(tuple):
+    """兼容旧版 PDF 解包逻辑，同时携带新版维度得分卡数据。"""
+
+    def __new__(cls, name, radar_io, line_io, dim_cards=None):
+        obj = super().__new__(cls, (name, radar_io, line_io))
+        obj.dim_cards = dim_cards or []
+        return obj
+
+
 def _set_matplotlib_chinese_font(app_dir=None):
     """
     为 matplotlib 设置中文字体，避免 PDF 导出图表在云端/无中文字体环境下乱码。
@@ -1521,7 +1531,7 @@ with st.sidebar:
                             _line_chart_behavior_matplotlib(labels, values, line_io, color_scheme=COLOR_SCHEME, app_dir=_app_dir)
                     except Exception:
                         pass
-                    person_details.append((name, radar_io, line_io, dim_cards))
+                    person_details.append(PDFPersonDetail(name, radar_io, line_io, dim_cards))
                 try:
                     report = PDFReport(app_dir=_app_dir, report_type="team")
                     pdf_buf = report.build(

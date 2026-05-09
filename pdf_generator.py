@@ -685,7 +685,9 @@ class PDFReport:
             story.append(Spacer(1, 0.3 * cm))
             for person_item in person_details:
                 name, radar_io, line_io = person_item[:3]
-                dim_cards = person_item[3] if len(person_item) > 3 else []
+                dim_cards = getattr(person_item, "dim_cards", None)
+                if dim_cards is None:
+                    dim_cards = person_item[3] if len(person_item) > 3 else []
                 row_cells = []
                 if radar_io and getattr(radar_io, "getvalue", None) and radar_io.getvalue():
                     try:
