@@ -281,18 +281,24 @@ class PDFReport:
         return None
 
     def _canvas_background(self, canvas, doc):
-        """在页面最底层绘制底图（铺满 A4），降低不透明度避免遮挡正文。"""
+        """在页面最底层绘制镜像底图，并降低不透明度，避免角标压住正文。"""
         path = getattr(self, "_background_path", None)
         if not path or not os.path.isfile(path):
             return
         try:
             canvas.saveState()
             try:
-                canvas.setOpacity(0.18)
-            except Exception:
-                pass
-            canvas.drawImage(path, 0, 0, width=A4[0], height=A4[1])
-            canvas.restoreState()
+                try:
+                    canvas.setOpacity(0.09)
+                except Exception:
+                    pass
+                # 原底图的装饰元素在左上/右下，容易与标题和页尾内容相遇。
+                # 横向镜像后装饰移到右上/左下，再配合低透明度，正文区域更干净。
+                canvas.translate(A4[0], 0)
+                canvas.scale(-1, 1)
+                canvas.drawImage(path, 0, 0, width=A4[0], height=A4[1], mask="auto")
+            finally:
+                canvas.restoreState()
         except Exception:
             pass
 
@@ -334,7 +340,7 @@ class PDFReport:
         summary_votes: [(模块名, 票数), ...] 希望重点学习的模块得票，按票数降序；无则传 None 或 []
         tenure_votes: [(选项, 人数), ...] 管理年限分布，按人数降序；无则传 None 或 []
         team_size_votes: [(选项, 人数), ...] 团队规模分布，按人数降序；无则传 None 或 []
-        person_details: [(姓名, 雷达图BytesIO, 折线图BytesIO), ...] 学员自陈结果细则，每人一行
+        person_details: [(姓名, 雷达图BytesIO, 折线图BytesIO, 维度得分卡), ...] 学员自陈结果细则，每人一行
         """
         if not REPORTLAB_AVAILABLE:
             raise RuntimeError("reportlab 未安装，请执行: pip install reportlab")
@@ -677,7 +683,9 @@ class PDFReport:
                 self.styles["note_red"],
             ))
             story.append(Spacer(1, 0.3 * cm))
-            for name, radar_io, line_io in person_details:
+            for person_item in person_details:
+                name, radar_io, line_io = person_item[:3]
+                dim_cards = person_item[3] if len(person_item) > 3 else []
                 row_cells = []
                 if radar_io and getattr(radar_io, "getvalue", None) and radar_io.getvalue():
                     try:
@@ -696,6 +704,38 @@ class PDFReport:
                 else:
                     row_cells.append(Paragraph("（折线图）", self.styles["body"]))
                 name_para = Paragraph(name, self.styles["heading2"])
+                blocks = [name_para]
+                if dim_cards:
+                    card_cells = []
+                    for dim, score in dim_cards:
+                        color = COLOR_SCHEME.get(dim, "#3498db")
+                        bg = colors.HexColor(_lighten_hex(color, blend_white=0.82))
+                        card = Table(
+                            [[
+                                Paragraph(escape(str(dim)), self.styles["table_cell_center_tight"]),
+                                Paragraph("%.2f" % float(score), self.styles["table_cell_center"]),
+                            ]],
+                            colWidths=[2.0 * cm, 1.0 * cm],
+                        )
+                        card.setStyle(TableStyle([
+                            ("BACKGROUND", (0, 0), (-1, -1), bg),
+                            ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor(color)),
+                            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                            ("LEFTPADDING", (0, 0), (-1, -1), 3),
+                            ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+                            ("TOPPADDING", (0, 0), (-1, -1), 4),
+                            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                        ]))
+                        card_cells.append(card)
+                    cards_table = Table([card_cells], colWidths=[3.0 * cm] * len(card_cells))
+                    cards_table.setStyle(TableStyle([
+                        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                    ]))
+                    blocks.extend([Spacer(1, 0.1 * cm), cards_table])
                 if len(row_cells) == 2:
                     t = Table([row_cells], colWidths=[5.5 * cm, 10.5 * cm])
                     t.setStyle(TableStyle([
@@ -703,9 +743,11 @@ class PDFReport:
                         ("ALIGN", (0, 0), (0, 0), "CENTER"),
                         ("ALIGN", (1, 0), (1, 0), "CENTER"),
                     ]))
-                    story.append(KeepTogether([name_para, Spacer(1, 0.2 * cm), t, Spacer(1, 0.4 * cm)]))
+                    blocks.extend([Spacer(1, 0.2 * cm), t, Spacer(1, 0.4 * cm)])
+                    story.append(KeepTogether(blocks))
                 else:
-                    story.append(KeepTogether([name_para, Spacer(1, 0.4 * cm)]))
+                    blocks.append(Spacer(1, 0.4 * cm))
+                    story.append(KeepTogether(blocks))
         story.append(PageBreak())
 
         # 第四部分：异常提醒

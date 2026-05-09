@@ -976,11 +976,11 @@ def _radar_chart_matplotlib(dim_labels, person_vals, out_buffer, avg_vals=None, 
 
 
 def _line_chart_behavior_matplotlib(labels, values, out_buffer, color_scheme=None, app_dir=None):
-    """用 matplotlib 绘制模块+行为项得分折线图。x=模块-行为项，y=得分；按模块着色。PDF 导出时纵轴统一为 1～5、步长 1。"""
+    """用 matplotlib 绘制行为项得分折线图。横轴仅显示行为项，模块归属通过色块和图例表达。"""
     _set_matplotlib_chinese_font(app_dir)
     plt.rcParams["font.sans-serif"] = plt.rcParams.get("font.sans-serif", ["SimHei", "PingFang SC", "Microsoft YaHei", "DejaVu Sans", "sans-serif"])
     plt.rcParams["axes.unicode_minus"] = False
-    fig, ax = plt.subplots(figsize=(9, 4.5))
+    fig, ax = plt.subplots(figsize=(9, 4.2))
     x_pos = list(range(len(labels)))
     vals = [float(v) if v is not None and str(v) != "nan" else 0.0 for v in values]
     if not vals:
@@ -988,17 +988,44 @@ def _line_chart_behavior_matplotlib(labels, values, out_buffer, color_scheme=Non
         return
     scheme = color_scheme or {}
     modules = [lab.split("-", 1)[0] if "-" in lab else "" for lab in labels]
+    behaviors = [lab.split("-", 1)[1] if "-" in lab else lab for lab in labels]
     colors = [scheme.get(m, "#2980B9") for m in modules]
-    for i in range(len(x_pos) - 1):
-        ax.plot(x_pos[i : i + 2], vals[i : i + 2], "-", color=colors[i], linewidth=2)
+
+    module_ranges = []
+    start = 0
+    for i in range(1, len(modules) + 1):
+        if i == len(modules) or modules[i] != modules[start]:
+            module_ranges.append((modules[start], start, i - 1))
+            start = i
+
+    for module, start, end in module_ranges:
+        color = scheme.get(module, "#2980B9")
+        ax.axvspan(start - 0.5, end + 0.5, color=color, alpha=0.08, linewidth=0)
+        ax.text(
+            (start + end) / 2,
+            5.42,
+            module,
+            ha="center",
+            va="top",
+            fontsize=9,
+            color=color,
+            fontweight="bold",
+        )
+        ax.plot(
+            x_pos[start : end + 1],
+            vals[start : end + 1],
+            "-",
+            color=color,
+            linewidth=2,
+        )
     ax.scatter(x_pos, vals, c=colors, s=28, zorder=5, edgecolors="white", linewidths=0.8)
     ax.set_xticks(x_pos)
-    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+    ax.set_xticklabels(behaviors, rotation=32, ha="right", fontsize=8)
     ax.set_ylabel("得分")
-    ax.set_xlabel("模块-行为项")
-    ax.set_ylim(1, 5)
+    ax.set_xlabel("行为项")
+    ax.set_ylim(1, 5.5)
     ax.set_yticks([1, 2, 3, 4, 5])
-    ax.grid(True, linestyle="--", alpha=0.6)
+    ax.grid(axis="y", linestyle="-", alpha=0.25)
     seen = []
     for m in modules:
         if m and m not in seen and m in scheme:
@@ -1008,11 +1035,14 @@ def _line_chart_behavior_matplotlib(labels, values, out_buffer, color_scheme=Non
         ax.legend(
             [Patch(facecolor=scheme[m], edgecolor="none") for m in seen],
             seen,
-            loc="upper right",
+            loc="lower center",
+            bbox_to_anchor=(0.5, -0.34),
             fontsize=8,
-            ncol=2,
+            ncol=min(5, max(1, len(seen))),
+            frameon=True,
+            fancybox=False,
         )
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0.08, 1, 1))
     fig.savefig(out_buffer, format="png", dpi=100, bbox_inches="tight")
     plt.close(fig)
     out_buffer.seek(0)
@@ -1457,6 +1487,12 @@ with st.sidebar:
                 summary_votes = learning_module_votes_pdf
                 dim_means_all = df_dims_pdf[dim_cols].mean() if dim_cols else pd.Series(dtype=float)
                 avg_dims = [float(dim_means_all[c]) for c in dim_cols] if len(dim_cols) == 5 else None
+                behavior_dim_order = []
+                for _, (cat, _) in col_to_cat_be.items():
+                    if cat in dim_cols and cat not in behavior_dim_order:
+                        behavior_dim_order.append(cat)
+                dim_cols_for_detail = behavior_dim_order if len(behavior_dim_order) == len(dim_cols) else dim_cols
+                avg_dims_for_detail = [float(dim_means_all[c]) for c in dim_cols_for_detail] if len(dim_cols_for_detail) == 5 else None
                 person_details = []
                 for i in range(len(names_pdf)):
                     name = names_pdf[i]
@@ -1470,11 +1506,13 @@ with st.sidebar:
                             continue
                     radar_io = io.BytesIO()
                     line_io = io.BytesIO()
+                    dim_cards = []
                     try:
-                        row_dims = df_dims_pdf.loc[row_index, dim_cols] if dim_cols else pd.Series(dtype=float)
-                        person_dims = [float(row_dims[c]) for c in dim_cols] if len(dim_cols) == 5 else []
+                        row_dims = df_dims_pdf.loc[row_index, dim_cols_for_detail] if dim_cols_for_detail else pd.Series(dtype=float)
+                        person_dims = [float(row_dims[c]) for c in dim_cols_for_detail] if len(dim_cols_for_detail) == 5 else []
+                        dim_cards = [(c, float(row_dims[c])) for c in dim_cols_for_detail] if len(dim_cols_for_detail) == 5 else []
                         if len(person_dims) == 5:
-                            _radar_chart_matplotlib(dim_cols, person_dims, radar_io, avg_vals=avg_dims, app_dir=_app_dir)
+                            _radar_chart_matplotlib(dim_cols_for_detail, person_dims, radar_io, avg_vals=avg_dims_for_detail, app_dir=_app_dir)
                     except Exception:
                         pass
                     try:
@@ -1483,7 +1521,7 @@ with st.sidebar:
                             _line_chart_behavior_matplotlib(labels, values, line_io, color_scheme=COLOR_SCHEME, app_dir=_app_dir)
                     except Exception:
                         pass
-                    person_details.append((name, radar_io, line_io))
+                    person_details.append((name, radar_io, line_io, dim_cards))
                 try:
                     report = PDFReport(app_dir=_app_dir, report_type="team")
                     pdf_buf = report.build(
